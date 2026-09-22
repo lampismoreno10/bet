@@ -1,0 +1,46 @@
+\# Code Review Rules - BET CRM
+
+
+
+\- Non introdurre bug o rompere funzionalita esistenti.
+
+\- TypeScript deve compilare senza errori.
+
+\- Evitare uso inutile di any.
+
+\- Controllare errori async/await e gestione errori.
+
+\- Nessuna API key, password o segreto nel codice o nel repository.
+
+\- .env e .env.local non devono essere committati.
+
+\- Validare i dati prima di salvarli su Supabase.
+
+\- Verificare autenticazione e autorizzazione.
+
+\- Tutte le tabelle Supabase sensibili devono avere RLS correttamente configurata.
+
+\- Un utente non deve poter leggere o modificare dati di altri utenti.
+
+\- Evitare query Supabase insicure.
+
+\- Non modificare lo schema database senza necessita.
+
+\- Il pulsante "Segna come giocata" deve salvare correttamente la giocata.
+
+\- Profitto, ROI, stake, EV e CLV devono avere calcoli corretti.
+
+\- Evitare duplicazioni di giocate.
+
+\- Gestire correttamente stati pending, won, lost e void.
+
+\- UI responsive e senza errori evidenti.
+
+\- Segnalare codice duplicato, inutilizzato o troppo complesso.
+
+\- Segnalare vulnerabilita e problemi di sicurezza.
+
+\- Segnalare dipendenze vulnerabili o obsolete.
+
+\- Non inventare dati reali; i dati demo devono essere chiaramente identificati.
+
