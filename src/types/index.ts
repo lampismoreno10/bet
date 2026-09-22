@@ -166,11 +166,17 @@ export interface SyncOutcome {
   requestsUsed: number;
   requestsLimit: number | null;
   requestsRemaining: number | null;
+  /** Partite API trovate (raw), somma delle date riuscite. */
+  totalReturned: number;
   fixturesFound: number;
   /** Righe inviate all'upsert (nuove + aggiornate). */
   fixturesImported: number;
   /** Solo le partite realmente nuove. */
   fixturesInserted: number;
+  /** Numero di date richieste alla sincronizzazione. */
+  datesChecked: number;
+  /** Esito per ogni data (per mostrare date saltate e motivo). */
+  dateStatuses: { date: string; ok: boolean; reason?: string }[];
 }
 
 // ------------------------------------------------------------

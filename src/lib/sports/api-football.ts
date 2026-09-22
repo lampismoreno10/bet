@@ -21,12 +21,19 @@ export type SportsApiErrorKind =
 export class SportsApiError extends Error {
   kind: SportsApiErrorKind;
   httpStatus?: number;
+  quota: ApiQuotaMeta;
 
-  constructor(message: string, kind: SportsApiErrorKind, httpStatus?: number) {
+  constructor(
+    message: string,
+    kind: SportsApiErrorKind,
+    httpStatus?: number,
+    quota: ApiQuotaMeta = { requestsLimit: null, requestsRemaining: null }
+  ) {
     super(message);
     this.name = "SportsApiError";
     this.kind = kind;
     this.httpStatus = httpStatus;
+    this.quota = quota;
   }
 }
 
@@ -96,16 +103,22 @@ function classifyApiErrors(errors: unknown): SportsApiError | null {
   const messages = extractApiErrors(errors);
   if (messages.length === 0) return null;
   const text = messages.join(" ");
+  const lower = text.toLowerCase();
 
-  if (keys.includes("rateLimit") || keys.includes("requests")) {
-    return new SportsApiError(`Quota API esaurita: ${text}`, "quota_exceeded");
-  }
   if (keys.includes("token")) {
     return new SportsApiError(
       `Chiave API non valida o non autorizzata: ${text}`,
       "unauthorized"
     );
   }
+
+  // La quota esaurita si riconosce dal testo (rate limit), non dalla sola
+  // chiave "requests": la stessa chiave è usata anche per altri errori
+  // (es. data fuori range sul piano Free).
+  if (/rate limit|too many requests|requests\/day|quota|limit reached/.test(lower)) {
+    return new SportsApiError(`Quota API esaurita: ${text}`, "quota_exceeded");
+  }
+
   return new SportsApiError(`Errore API-Football: ${text}`, "unknown");
 }
 
@@ -164,7 +177,8 @@ async function apiGet(
     throw new SportsApiError(
       "Quota API esaurita (HTTP 429). Riprova domani o aumenta il piano.",
       "quota_exceeded",
-      429
+      429,
+      quota
     );
   }
 
@@ -172,7 +186,8 @@ async function apiGet(
     throw new SportsApiError(
       `API-Football ha risposto con HTTP ${response.status}.`,
       "http",
-      response.status
+      response.status,
+      quota
     );
   }
 
@@ -180,12 +195,18 @@ async function apiGet(
   try {
     payload = (await response.json()) as ApiResponse["payload"];
   } catch {
-    throw new SportsApiError("Risposta di API-Football non leggibile.", "unknown");
+    throw new SportsApiError(
+      "Risposta di API-Football non leggibile.",
+      "unknown",
+      response.status,
+      quota
+    );
   }
 
   const apiError = classifyApiErrors(payload.errors);
   if (apiError) {
     apiError.httpStatus = response.status;
+    apiError.quota = quota;
     throw apiError;
   }
 
@@ -223,48 +244,101 @@ export async function fetchFixturesByDate(date: string): Promise<FixturesResult>
   };
 }
 
-/**
- * Recupera le partite di più date (oggi + domani + dopodomani).
- * Consuma UNA richiesta per data.
- */
-export async function fetchFixturesByDates(dates: string[]): Promise<{
+/** Esito della sincronizzazione di una singola data. */
+export interface DateFetchOutcome {
+  date: string;
+  ok: boolean;
   fixtures: ApiFootballFixture[];
   totalReturned: number;
+  pagesTotal: number;
+  leaguesFound: { id: number; name: string }[];
+  quota: ApiQuotaMeta;
+  errorMessage: string | null;
+  errorKind: SportsApiErrorKind | null;
+}
+
+export interface MultiDateFixtures {
+  dates: DateFetchOutcome[];
+  fixtures: ApiFootballFixture[];
   leaguesFound: { id: number; name: string }[];
   pagesTotal: number;
   requestsUsed: number;
   quota: ApiQuotaMeta;
-}> {
-  let all: ApiFootballFixture[] = [];
-  let totalReturned = 0;
-  let pagesTotal = 1;
+}
+
+/**
+ * Recupera le partite di più date, UNA richiesta per data.
+ *
+ * RESILIENTE: se una singola data fallisce (es. fuori dal range consentito
+ * dal piano Free), NON interrompe il resto: prosegue con le date valide e
+ * riporta per ogni data l'esito e il motivo. Non esegue retry.
+ */
+export async function fetchFixturesByDates(
+  dates: string[]
+): Promise<MultiDateFixtures> {
+  const outcomes: DateFetchOutcome[] = [];
   let requestsUsed = 0;
   let quota: ApiQuotaMeta = { requestsLimit: null, requestsRemaining: null };
-  const leagueMap = new Map<number, string>();
 
   for (const date of dates) {
     try {
       const r = await fetchFixturesByDate(date);
       requestsUsed += 1;
       quota = r.quota;
-      totalReturned += r.totalReturned;
-      pagesTotal = Math.max(pagesTotal, r.pagesTotal);
-      all = all.concat(r.fixtures);
-      for (const l of r.leaguesFound) leagueMap.set(l.id, l.name);
+      outcomes.push({
+        date,
+        ok: true,
+        fixtures: r.fixtures,
+        totalReturned: r.totalReturned,
+        pagesTotal: r.pagesTotal,
+        leaguesFound: r.leaguesFound,
+        quota: r.quota,
+        errorMessage: null,
+        errorKind: null,
+      });
     } catch (err) {
-      // Se una data fallisce (es. quota esaurita) propaga l'errore: è
-      // più importante segnalarlo che proseguire con dati parziali.
-      throw err;
+      // La chiamata è stata comunque effettuata (tranne missing_key, già
+      // gestito a monte). Non retry: registra e prosegui.
+      requestsUsed += 1;
+      const q =
+        err instanceof SportsApiError
+          ? err.quota
+          : { requestsLimit: null, requestsRemaining: null };
+      if (q.requestsLimit != null || q.requestsRemaining != null) quota = q;
+
+      outcomes.push({
+        date,
+        ok: false,
+        fixtures: [],
+        totalReturned: 0,
+        pagesTotal: 1,
+        leaguesFound: [],
+        quota: q,
+        errorMessage: err instanceof Error ? err.message : "errore sconosciuto",
+        errorKind: err instanceof SportsApiError ? err.kind : "unknown",
+      });
     }
   }
 
   // Dedup su fixture.id (una partita non deve comparire due volte).
   const byId = new Map<number, ApiFootballFixture>();
-  for (const f of all) byId.set(f.fixture.id, f);
-  const fixtures = [...byId.values()];
-  const leaguesFound = [...leagueMap.entries()].map(([id, name]) => ({ id, name }));
+  const leagueMap = new Map<number, string>();
+  let pagesTotal = 1;
+  for (const o of outcomes) {
+    if (!o.ok) continue;
+    for (const f of o.fixtures) byId.set(f.fixture.id, f);
+    for (const l of o.leaguesFound) leagueMap.set(l.id, l.name);
+    pagesTotal = Math.max(pagesTotal, o.pagesTotal);
+  }
 
-  return { fixtures, totalReturned, leaguesFound, pagesTotal, requestsUsed, quota };
+  return {
+    dates: outcomes,
+    fixtures: [...byId.values()],
+    leaguesFound: [...leagueMap.entries()].map(([id, name]) => ({ id, name })),
+    pagesTotal,
+    requestsUsed,
+    quota,
+  };
 }
 
 /**

@@ -32,16 +32,45 @@ interface ControlStatus {
   lastError: string | null;
 }
 
+function shortDate(date: string): string {
+  const [, m, d] = date.split("-");
+  return `${d}/${m}`;
+}
+
 function syncResult(res: SyncOutcome): OpResult {
   const tone: Tone =
     res.status === "ok" ? "ok" : res.status === "quota_exceeded" ? "partial" : "error";
-  return {
-    message: res.message,
-    tone,
-    detail: `Richieste API: ${res.requestsUsed} · quota residua: ${
-      res.requestsRemaining ?? "?"
-    }${res.requestsLimit != null ? ` / ${res.requestsLimit}` : ""}`,
-  };
+
+  const lines: string[] = [];
+  if (res.status === "ok") lines.push("Sincronizzazione completata");
+  else if (res.status === "quota_exceeded") lines.push("Quota API esaurita");
+  else lines.push("Sincronizzazione non riuscita");
+
+  if (res.datesChecked > 0) {
+    lines.push(`Date controllate: ${res.datesChecked}`);
+    for (const d of res.dateStatuses) {
+      lines.push(
+        `${shortDate(d.date)} ${d.ok ? "OK" : `non disponibile col piano corrente${d.reason ? ` (${d.reason})` : ""}`}`
+      );
+    }
+  }
+
+  if (res.status !== "error") {
+    lines.push(
+      `Partite API trovate: ${res.totalReturned}`,
+      `Partite dei campionati seguiti: ${res.fixturesFound}`,
+      `Nuove: ${res.fixturesInserted}`,
+      `Aggiornate: ${res.fixturesImported - res.fixturesInserted}`,
+      `Richieste API: ${res.requestsUsed}`,
+      `Quota residua: ${
+        res.requestsRemaining != null
+          ? `${res.requestsRemaining}/${res.requestsLimit ?? "N/D"}`
+          : "N/D"
+      }`
+    );
+  }
+
+  return { message: res.message, tone, detail: lines.join("\n") };
 }
 
 function analysisResult(res: AnalysisOutcome): OpResult {
@@ -154,16 +183,13 @@ export function ControlPanel({
       {/* Stato operazioni */}
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
         <StatusItem label="Ultimo aggiornamento" value={status.lastSyncAt ? formatDateTime(status.lastSyncAt) : "—"} />
-        <StatusItem label="Richieste oggi" value={String(status.todayRequests)} />
-        <StatusItem
-          label="Quota residua"
-          value={status.quotaRemaining != null ? `${status.quotaRemaining}${status.quotaLimit != null ? ` / ${status.quotaLimit}` : ""}` : "—"}
-        />
+        <StatusItem label="Quota giornaliera" value={status.quotaLimit != null ? String(status.quotaLimit) : "N/D"} />
+        <StatusItem label="Richieste residue" value={status.quotaRemaining != null ? String(status.quotaRemaining) : "N/D"} />
+        <StatusItem label="Richieste usate oggi" value={String(status.todayRequests)} />
         <StatusItem label="Partite trovate" value={status.lastSyncFound != null ? String(status.lastSyncFound) : "—"} />
         <StatusItem label="Partite analizzate" value={status.lastAnalysisAnalyzed != null ? String(status.lastAnalysisAnalyzed) : "—"} />
         <StatusItem label="Analisi create" value={status.lastAnalysisCreated != null ? String(status.lastAnalysisCreated) : "—"} />
         <StatusItem label="In attesa di analisi" value={String(pendingAnalysisCount)} />
-        <StatusItem label="Ultima analisi" value={status.lastAnalysisAt ? formatDateTime(status.lastAnalysisAt) : "—"} />
       </div>
 
       {status.lastError && (
@@ -225,7 +251,9 @@ function ResultBox({ result }: { result: OpResult }) {
   return (
     <div className={`mt-3 rounded-xl border px-4 py-3 text-sm ${TONE_STYLES[result.tone]}`}>
       <p>{result.message}</p>
-      {result.detail && <p className="mt-1 text-xs opacity-80">{result.detail}</p>}
+      {result.detail && (
+        <pre className="mt-1 whitespace-pre-line text-xs opacity-80">{result.detail}</pre>
+      )}
     </div>
   );
 }
