@@ -4,11 +4,6 @@
 // ⚠️ Questo modulo NON deve essere importato da Client Component:
 // usa la chiave `SPORTS_API_KEY` (senza prefisso NEXT_PUBLIC_), che
 // deve restare esclusivamente sul server.
-//
-// Ottimizzazione richieste: l'endpoint /fixtures accetta il parametro
-// `date`, che restituisce TUTTE le partite di quel giorno in una sola
-// chiamata. Filtriamo poi i campionati di interesse in locale, così
-// l'import costa 1 richiesta invece di 10 (una per campionato).
 // ============================================================
 
 import { isTrackedLeague } from "@/lib/sports/leagues";
@@ -46,6 +41,7 @@ export interface ApiFootballFixture {
     home: { id: number; name: string };
     away: { id: number; name: string };
   };
+  goals?: { home: number | null; away: number | null };
 }
 
 export interface ApiQuotaMeta {
@@ -68,7 +64,7 @@ export function isSportsApiConfigured(): boolean {
   return Boolean(process.env.SPORTS_API_KEY);
 }
 
-function toNumberOrNull(value: string | null): number | null {
+function toNumberOrNull(value: unknown): number | null {
   if (value == null) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
@@ -102,10 +98,7 @@ function classifyApiErrors(errors: unknown): SportsApiError | null {
   const text = messages.join(" ");
 
   if (keys.includes("rateLimit") || keys.includes("requests")) {
-    return new SportsApiError(
-      `Quota API esaurita: ${text}`,
-      "quota_exceeded"
-    );
+    return new SportsApiError(`Quota API esaurita: ${text}`, "quota_exceeded");
   }
   if (keys.includes("token")) {
     return new SportsApiError(
@@ -116,11 +109,20 @@ function classifyApiErrors(errors: unknown): SportsApiError | null {
   return new SportsApiError(`Errore API-Football: ${text}`, "unknown");
 }
 
-/**
- * Recupera le partite di una data (formato YYYY-MM-DD).
- * Consuma UNA sola richiesta API.
- */
-export async function fetchFixturesByDate(date: string): Promise<FixturesResult> {
+interface ApiResponse {
+  payload: {
+    response?: unknown;
+    errors?: unknown;
+    paging?: { current?: number; total?: number };
+  };
+  quota: ApiQuotaMeta;
+}
+
+/** Esegue una GET verso API-Football e restituisce payload + quota. */
+async function apiGet(
+  path: string,
+  params: Record<string, string>
+): Promise<ApiResponse> {
   const apiKey = process.env.SPORTS_API_KEY;
   if (!apiKey) {
     throw new SportsApiError(
@@ -129,9 +131,10 @@ export async function fetchFixturesByDate(date: string): Promise<FixturesResult>
     );
   }
 
-  const url = new URL("/fixtures", API_BASE_URL);
-  url.searchParams.set("date", date);
-  url.searchParams.set("timezone", "Europe/Rome");
+  const url = new URL(path, API_BASE_URL);
+  for (const [k, v] of Object.entries(params)) {
+    url.searchParams.set(k, v);
+  }
 
   let response: Response;
   try {
@@ -149,7 +152,9 @@ export async function fetchFixturesByDate(date: string): Promise<FixturesResult>
   }
 
   const quota: ApiQuotaMeta = {
-    requestsLimit: toNumberOrNull(response.headers.get("x-ratelimit-requests-limit")),
+    requestsLimit: toNumberOrNull(
+      response.headers.get("x-ratelimit-requests-limit")
+    ),
     requestsRemaining: toNumberOrNull(
       response.headers.get("x-ratelimit-requests-remaining")
     ),
@@ -171,29 +176,36 @@ export async function fetchFixturesByDate(date: string): Promise<FixturesResult>
     );
   }
 
-  let payload: {
-    response?: unknown;
-    errors?: unknown;
-    paging?: { current?: number; total?: number };
-  };
+  let payload: ApiResponse["payload"];
   try {
-    payload = (await response.json()) as typeof payload;
+    payload = (await response.json()) as ApiResponse["payload"];
   } catch {
     throw new SportsApiError("Risposta di API-Football non leggibile.", "unknown");
   }
 
-  // API-Football può restituire HTTP 200 con gli errori nel corpo.
   const apiError = classifyApiErrors(payload.errors);
   if (apiError) {
     apiError.httpStatus = response.status;
     throw apiError;
   }
 
+  return { payload, quota };
+}
+
+/**
+ * Recupera le partite di una data (formato YYYY-MM-DD).
+ * Consuma UNA richiesta API.
+ */
+export async function fetchFixturesByDate(date: string): Promise<FixturesResult> {
+  const { payload, quota } = await apiGet("/fixtures", {
+    date,
+    timezone: "Europe/Rome",
+  });
+
   const raw = Array.isArray(payload.response) ? payload.response : [];
   const fixtures = raw as ApiFootballFixture[];
   const filtered = fixtures.filter((f) => isTrackedLeague(f.league?.id));
 
-  // Campionati distinti presenti nella risposta (per capire cosa è arrivato).
   const seen = new Map<number, string>();
   for (const f of fixtures) {
     if (f.league?.id != null && !seen.has(f.league.id)) {
@@ -208,5 +220,204 @@ export async function fetchFixturesByDate(date: string): Promise<FixturesResult>
     pagesTotal: payload.paging?.total ?? 1,
     leaguesFound,
     quota,
+  };
+}
+
+/**
+ * Recupera le partite di più date (oggi + domani + dopodomani).
+ * Consuma UNA richiesta per data.
+ */
+export async function fetchFixturesByDates(dates: string[]): Promise<{
+  fixtures: ApiFootballFixture[];
+  totalReturned: number;
+  leaguesFound: { id: number; name: string }[];
+  pagesTotal: number;
+  requestsUsed: number;
+  quota: ApiQuotaMeta;
+}> {
+  let all: ApiFootballFixture[] = [];
+  let totalReturned = 0;
+  let pagesTotal = 1;
+  let requestsUsed = 0;
+  let quota: ApiQuotaMeta = { requestsLimit: null, requestsRemaining: null };
+  const leagueMap = new Map<number, string>();
+
+  for (const date of dates) {
+    try {
+      const r = await fetchFixturesByDate(date);
+      requestsUsed += 1;
+      quota = r.quota;
+      totalReturned += r.totalReturned;
+      pagesTotal = Math.max(pagesTotal, r.pagesTotal);
+      all = all.concat(r.fixtures);
+      for (const l of r.leaguesFound) leagueMap.set(l.id, l.name);
+    } catch (err) {
+      // Se una data fallisce (es. quota esaurita) propaga l'errore: è
+      // più importante segnalarlo che proseguire con dati parziali.
+      throw err;
+    }
+  }
+
+  // Dedup su fixture.id (una partita non deve comparire due volte).
+  const byId = new Map<number, ApiFootballFixture>();
+  for (const f of all) byId.set(f.fixture.id, f);
+  const fixtures = [...byId.values()];
+  const leaguesFound = [...leagueMap.entries()].map(([id, name]) => ({ id, name }));
+
+  return { fixtures, totalReturned, leaguesFound, pagesTotal, requestsUsed, quota };
+}
+
+/**
+ * Recupera una lista di partite per id (fixture id), raggruppandole in
+ * un'unica richiesta. Usato da "Aggiorna risultati".
+ */
+export async function fetchFixturesByIds(ids: number[]): Promise<ApiFootballFixture[]> {
+  if (ids.length === 0) return [];
+  const { payload } = await apiGet("/fixtures", {
+    ids: ids.join("-"),
+  });
+  const raw = Array.isArray(payload.response) ? payload.response : [];
+  return raw as ApiFootballFixture[];
+}
+
+// ------------------------------------------------------------
+// Deep data (per l'analisi). Ogni funzione è "best effort": il chiamante
+// le avvolge in try/catch e, in caso di errore, tratta il dato come
+// non disponibile invece di far fallire l'intera pipeline.
+// ------------------------------------------------------------
+
+export interface TeamStatistics {
+  form: string | null;
+  goalsFor: number | null;
+  goalsAgainst: number | null;
+  wins: number | null;
+  draws: number | null;
+  losses: number | null;
+}
+
+export interface HeadToHeadMatch {
+  date: string;
+  homeTeam: string;
+  awayTeam: string;
+  homeGoals: number | null;
+  awayGoals: number | null;
+}
+
+export interface StandingRow {
+  rank: number;
+  team: string;
+  points: number;
+}
+
+export interface InjuryInfo {
+  team: string;
+  player: string;
+  type: string;
+  reason: string;
+}
+
+export interface FixtureOdds {
+  bookmaker: string;
+  markets: { name: string; values: { value: string; odd: number }[] }[];
+}
+
+export async function fetchTeamStatistics(
+  teamId: number,
+  leagueId: number,
+  season: number
+): Promise<TeamStatistics | null> {
+  const { payload } = await apiGet("/teams/statistics", {
+    team: String(teamId),
+    league: String(leagueId),
+    season: String(season),
+  });
+  const r = (payload.response as Record<string, unknown> | null) ?? null;
+  if (!r) return null;
+
+  return {
+    form: typeof r.form === "string" ? r.form : null,
+    goalsFor: toNumberOrNull((r.goals as any)?.for?.total?.total),
+    goalsAgainst: toNumberOrNull((r.goals as any)?.against?.total?.total),
+    wins: toNumberOrNull((r.fixtures as any)?.wins?.total),
+    draws: toNumberOrNull((r.fixtures as any)?.draws?.total),
+    losses: toNumberOrNull((r.fixtures as any)?.loses?.total),
+  };
+}
+
+export async function fetchHeadToHead(
+  homeTeamId: number,
+  awayTeamId: number
+): Promise<HeadToHeadMatch[] | null> {
+  const { payload } = await apiGet("/fixtures/headtohead", {
+    h2h: `${homeTeamId}-${awayTeamId}`,
+  });
+  const arr = Array.isArray(payload.response) ? payload.response : [];
+  if (arr.length === 0) return null;
+  return arr.slice(0, 10).map((f: any) => ({
+    date: f?.fixture?.date ?? "",
+    homeTeam: f?.teams?.home?.name ?? "?",
+    awayTeam: f?.teams?.away?.name ?? "?",
+    homeGoals: toNumberOrNull(f?.goals?.home),
+    awayGoals: toNumberOrNull(f?.goals?.away),
+  }));
+}
+
+export async function fetchStandings(
+  leagueId: number,
+  season: number
+): Promise<StandingRow[] | null> {
+  const { payload } = await apiGet("/standings", {
+    league: String(leagueId),
+    season: String(season),
+  });
+  const first = (Array.isArray(payload.response) ? payload.response : [])[0] as any;
+  const groups = first?.league?.standings;
+  if (!Array.isArray(groups)) return null;
+
+  const rows: StandingRow[] = [];
+  for (const g of groups) {
+    if (!Array.isArray(g)) continue;
+    for (const r of g) {
+      rows.push({
+        rank: Number(r?.rank ?? 0),
+        team: r?.team?.name ?? "?",
+        points: Number(r?.points ?? 0),
+      });
+    }
+  }
+  return rows.length > 0 ? rows : null;
+}
+
+export async function fetchInjuries(teamId: number): Promise<InjuryInfo[] | null> {
+  const { payload } = await apiGet("/injuries", { team: String(teamId) });
+  const arr = Array.isArray(payload.response) ? payload.response : [];
+  if (arr.length === 0) return null;
+  return arr.slice(0, 20).map((i: any) => ({
+    team: i?.team?.name ?? "?",
+    player: i?.player?.name ?? "?",
+    type: i?.player?.type ?? "?",
+    reason: i?.player?.reason ?? "",
+  }));
+}
+
+export async function fetchFixtureOdds(
+  fixtureId: number
+): Promise<FixtureOdds | null> {
+  // L'endpoint /odds è spesso riservato ai piani a pagamento: se non
+  // disponibile restituisce errore/403, gestito dal chiamante.
+  const { payload } = await apiGet("/odds", { fixture: String(fixtureId) });
+  const arr = Array.isArray(payload.response) ? payload.response : [];
+  const bookmaker = (arr[0] as any)?.bookmakers?.[0];
+  if (!bookmaker) return null;
+
+  return {
+    bookmaker: bookmaker.name ?? "?",
+    markets: (bookmaker.bets ?? []).slice(0, 5).map((b: any) => ({
+      name: b?.name ?? "?",
+      values: (b?.values ?? []).slice(0, 3).map((v: any) => ({
+        value: v?.value ?? "?",
+        odd: Number(v?.odd ?? 0),
+      })),
+    })),
   };
 }

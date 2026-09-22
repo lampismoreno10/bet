@@ -20,11 +20,18 @@ export type BetStatus = "open" | "won" | "lost" | "void";
 
 export interface Match {
   id: string;
+  externalId: string | null; // id partita sulla fonte esterna (API-Football)
   competition: string; // campionato/competizione
   homeTeam: string;
   awayTeam: string;
   kickoffAt: string; // ISO 8601
   state: MatchState;
+  leagueId: number | null;
+  season: number | null;
+  homeTeamId: number | null;
+  awayTeamId: number | null;
+  homeScore: number | null;
+  awayScore: number | null;
   isDemo?: boolean;
 }
 
@@ -164,4 +171,46 @@ export interface SyncOutcome {
   fixturesImported: number;
   /** Solo le partite realmente nuove. */
   fixturesInserted: number;
+}
+
+// ------------------------------------------------------------
+// Operazioni di analisi automatica e aggiornamento risultati
+// ------------------------------------------------------------
+
+export type AnalysisOutcomeStatus = "ok" | "error" | "partial";
+
+/** Esito del pulsante "Analizza partite" / "Aggiorna + Analizza". */
+export interface AnalysisOutcome {
+  ok: boolean;
+  status: AnalysisOutcomeStatus;
+  message: string;
+  candidatesFound: number;
+  analyzed: number;
+  analysesCreated: number;
+  requestsUsed: number; // richieste API-Football consumate
+  deepseekCalls: number; // chiamate a DeepSeek
+  errors: string[];
+}
+
+/** Esito del pulsante "Aggiorna risultati". */
+export interface ResultsOutcome {
+  ok: boolean;
+  message: string;
+  requestsUsed: number;
+  updated: number;
+  finished: number;
+  errors: string[];
+}
+
+/** Un'operazione di analisi registrata (per lo stato in dashboard). */
+export interface AnalysisRun {
+  id: string;
+  candidatesFound: number;
+  analyzed: number;
+  analysesCreated: number;
+  requestsUsed: number;
+  deepseekCalls: number;
+  status: AnalysisOutcomeStatus;
+  errorMessage: string | null;
+  createdAt: string;
 }

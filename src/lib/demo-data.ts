@@ -29,7 +29,22 @@ function match(
   kickoffAt: string,
   state: MatchState
 ): Match {
-  return { id, competition, homeTeam, awayTeam, kickoffAt, state, isDemo: true };
+  return {
+    id,
+    externalId: null,
+    competition,
+    homeTeam,
+    awayTeam,
+    kickoffAt,
+    state,
+    leagueId: null,
+    season: null,
+    homeTeamId: null,
+    awayTeamId: null,
+    homeScore: null,
+    awayScore: null,
+    isDemo: true,
+  };
 }
 
 function analysis(

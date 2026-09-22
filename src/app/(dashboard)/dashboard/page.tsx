@@ -1,16 +1,18 @@
 import Link from "next/link";
 
+import { ControlPanel } from "@/components/control-panel";
 import { ImportedFixturesList } from "@/components/imported-fixtures-list";
 import { MatchCard } from "@/components/match-card";
 import { StatCard } from "@/components/stat-card";
-import { SyncFixturesPanel } from "@/components/sync-fixtures-panel";
 import { isAdminEmail, isDemoMode } from "@/lib/config";
 import {
   computeBankroll,
+  getAnalysisCandidates,
   getBankrollTransactions,
   getBets,
   getCandidateMatches,
   getFixturesWithoutAnalysis,
+  getLastAnalysisRun,
   getLastSyncRun,
   getTodayApiUsage,
 } from "@/lib/data";
@@ -18,7 +20,7 @@ import { currentMonthPeriod, isToday, monthPeriodOf } from "@/lib/dates";
 import { formatEuro, formatPercent } from "@/lib/format";
 import { computeStats } from "@/lib/stats";
 import { createClient } from "@/lib/supabase/server";
-import type { Match, SyncRun } from "@/types";
+import type { AnalysisRun, Match, SyncRun } from "@/types";
 
 export const dynamic = "force-dynamic";
 
@@ -33,7 +35,9 @@ export default async function DashboardPage() {
 
   let isAdmin = false;
   let importedFixtures: Match[] = [];
-  let lastRun: SyncRun | null = null;
+  let pendingAnalysisCount = 0;
+  let lastSyncRun: SyncRun | null = null;
+  let lastAnalysisRun: AnalysisRun | null = null;
   let todayUsage = { requests: 0, runs: 0 };
 
   if (!demo) {
@@ -43,13 +47,17 @@ export default async function DashboardPage() {
     } = await supabase.auth.getUser();
     isAdmin = isAdminEmail(user?.email);
 
-    const [imported, run, usage] = await Promise.all([
+    const [imported, pending, syncRun, analysisRun, usage] = await Promise.all([
       getFixturesWithoutAnalysis(),
+      getAnalysisCandidates(),
       getLastSyncRun(),
+      getLastAnalysisRun(),
       getTodayApiUsage(),
     ]);
     importedFixtures = imported;
-    lastRun = run;
+    pendingAnalysisCount = pending.length;
+    lastSyncRun = syncRun;
+    lastAnalysisRun = analysisRun;
     todayUsage = usage;
   }
 
@@ -115,10 +123,20 @@ export default async function DashboardPage() {
 
       {!demo && (
         <div className="mt-6">
-          <SyncFixturesPanel
+          <ControlPanel
             isAdmin={isAdmin}
-            lastRun={lastRun}
-            todayRequests={todayUsage.requests}
+            pendingAnalysisCount={pendingAnalysisCount}
+            status={{
+              lastSyncAt: lastSyncRun?.createdAt ?? null,
+              lastAnalysisAt: lastAnalysisRun?.createdAt ?? null,
+              todayRequests: todayUsage.requests,
+              quotaRemaining: lastSyncRun?.requestsRemaining ?? null,
+              quotaLimit: lastSyncRun?.requestsLimit ?? null,
+              lastSyncFound: lastSyncRun?.fixturesFound ?? null,
+              lastAnalysisAnalyzed: lastAnalysisRun?.analyzed ?? null,
+              lastAnalysisCreated: lastAnalysisRun?.analysesCreated ?? null,
+              lastError: lastSyncRun?.errorMessage ?? lastAnalysisRun?.errorMessage ?? null,
+            }}
           />
         </div>
       )}
@@ -136,8 +154,9 @@ export default async function DashboardPage() {
             Nessuna partita candidata
           </p>
           <p className="mx-auto mt-1 max-w-md text-sm text-zinc-500">
-            Aggiungi una partita con la relativa analisi, oppure importa le
-            partite di oggi con &quot;Aggiorna partite&quot;.
+            Aggiungi una partita con la relativa analisi, oppure usa
+            &quot;Aggiorna partite&quot; e &quot;Analizza partite&quot; nel
+            pannello di controllo.
           </p>
           <Link href="/matches/new" className="btn-primary mt-4">
             + Nuova partita
@@ -158,9 +177,7 @@ export default async function DashboardPage() {
               <h2 className="text-lg font-semibold tracking-tight text-zinc-100">
                 Partite importate
               </h2>
-              <p className="text-sm text-zinc-500">
-                In attesa di analisi
-              </p>
+              <p className="text-sm text-zinc-500">In attesa di analisi</p>
             </div>
             <span className="text-sm text-zinc-500">
               {importedFixtures.length} partite

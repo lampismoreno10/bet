@@ -1,3 +1,4 @@
+import { BudgetManager } from "@/components/budget-manager";
 import { StatCard } from "@/components/stat-card";
 import {
   computeBankroll,
@@ -69,6 +70,11 @@ export default async function BudgetPage() {
       </div>
 
       <h2 className="mb-3 text-sm font-semibold tracking-tight text-zinc-100">
+        Gestisci budget e fondi
+      </h2>
+      <BudgetManager />
+
+      <h2 className="mb-3 mt-8 text-sm font-semibold tracking-tight text-zinc-100">
         Limiti di budget
       </h2>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">

@@ -22,6 +22,18 @@ export function todayIsoDate(now: Date = new Date()): string {
   return dayFmt.format(now);
 }
 
+/**
+ * Data ISO "YYYY-MM-DD" spostata di N giorni rispetto a oggi (timezone Roma).
+ * Lavora sulla componente "giorno" della data (non sul timestamp), così è
+ * immune ai cambi d'ora legale (DST).
+ */
+export function isoDateOffset(offsetDays: number, now: Date = new Date()): string {
+  if (offsetDays === 0) return dayFmt.format(now);
+  const [y, m, d] = dayFmt.format(now).split("-").map(Number);
+  const shifted = new Date(Date.UTC(y, m - 1, d + offsetDays));
+  return dayFmt.format(shifted);
+}
+
 /** Periodo mensile "YYYY-MM" di una data ISO. */
 export function monthPeriodOf(iso: string): string {
   const d = new Date(iso);

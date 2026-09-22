@@ -7,6 +7,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { isDemoMode } from "@/lib/config";
 import { todayIsoDate } from "@/lib/dates";
+import { selectCandidates } from "@/lib/analysis";
 import {
   demoAnalyses,
   demoBankrollTransactions,
@@ -17,6 +18,7 @@ import {
 } from "@/lib/demo-data";
 import type {
   Analysis,
+  AnalysisRun,
   AnalysisState,
   BankrollTransaction,
   Bet,
@@ -35,11 +37,18 @@ import type {
 function mapMatch(row: any): Match {
   return {
     id: row.id,
+    externalId: row.external_id != null ? String(row.external_id) : null,
     competition: row.competition,
     homeTeam: row.home_team,
     awayTeam: row.away_team,
     kickoffAt: row.kickoff_at,
     state: row.status,
+    leagueId: row.league_id != null ? Number(row.league_id) : null,
+    season: row.season != null ? Number(row.season) : null,
+    homeTeamId: row.home_team_id != null ? Number(row.home_team_id) : null,
+    awayTeamId: row.away_team_id != null ? Number(row.away_team_id) : null,
+    homeScore: row.home_score != null ? Number(row.home_score) : null,
+    awayScore: row.away_score != null ? Number(row.away_score) : null,
   };
 }
 
@@ -121,6 +130,20 @@ function mapSyncRun(row: any): SyncRun {
     fixturesFound: Number(row.fixtures_found ?? 0),
     fixturesImported: Number(row.fixtures_imported ?? 0),
     fixturesInserted: Number(row.fixtures_inserted ?? 0),
+    status: row.status,
+    errorMessage: row.error_message ?? null,
+    createdAt: row.created_at,
+  };
+}
+
+function mapAnalysisRun(row: any): AnalysisRun {
+  return {
+    id: row.id,
+    candidatesFound: Number(row.candidates_found ?? 0),
+    analyzed: Number(row.analyzed ?? 0),
+    analysesCreated: Number(row.analyses_created ?? 0),
+    requestsUsed: Number(row.requests_used ?? 0),
+    deepseekCalls: Number(row.deepseek_calls ?? 0),
     status: row.status,
     errorMessage: row.error_message ?? null,
     createdAt: row.created_at,
@@ -309,7 +332,52 @@ export async function getLastSyncRun(): Promise<SyncRun | null> {
   return data ? mapSyncRun(data) : null;
 }
 
-/** Chiamate API consumate oggi (per controllare il limite giornaliero). */
+/**
+ * Partite candidate all'analisi: importate, senza analisi, in programma
+ * o in corso, ordinate per calcio d'inizio e limitate dal pre-filtro.
+ * (Nessuna chiamata API: è il pre-filtro locale.)
+ */
+export async function getAnalysisCandidates(max?: number): Promise<Match[]> {
+  if (isDemoMode()) return [];
+
+  const supabase = await createClient();
+  const [{ data: matches }, { data: analyses }] = await Promise.all([
+    supabase
+      .from("matches")
+      .select("*")
+      .not("external_id", "is", null)
+      // Solo partite non ancora terminate: evita di caricare lo storico
+      // (che altrimenti riempirebbe la finestra del limit).
+      .in("status", ["scheduled", "live"])
+      .order("kickoff_at", { ascending: true })
+      .limit(300),
+    supabase.from("analyses").select("match_id"),
+  ]);
+
+  const analyzed = new Set((analyses ?? []).map((a) => a.match_id));
+  const unanalyzed = (matches ?? [])
+    .filter((m) => !analyzed.has(m.id))
+    .map(mapMatch);
+
+  return selectCandidates(unanalyzed, max);
+}
+
+/** Ultima operazione di analisi registrata (null se mai eseguita). */
+export async function getLastAnalysisRun(): Promise<AnalysisRun | null> {
+  if (isDemoMode()) return null;
+
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("analysis_runs")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return data ? mapAnalysisRun(data) : null;
+}
+
+/** Chiamate API-Football consumate oggi (sync + analisi). */
 export async function getTodayApiUsage(): Promise<{
   requests: number;
   runs: number;
@@ -317,14 +385,19 @@ export async function getTodayApiUsage(): Promise<{
   if (isDemoMode()) return { requests: 0, runs: 0 };
 
   const supabase = await createClient();
-  const { data } = await supabase
-    .from("api_sync_runs")
-    .select("requests_used")
-    .eq("sync_date", todayIsoDate());
+  const today = todayIsoDate();
 
-  const rows = data ?? [];
+  // Entrambe le tabelle hanno sync_date: confronto esatto, senza fusi.
+  const [{ data: syncRows }, { data: analysisRows }] = await Promise.all([
+    supabase.from("api_sync_runs").select("requests_used").eq("sync_date", today),
+    supabase.from("analysis_runs").select("requests_used").eq("sync_date", today),
+  ]);
+
+  const sum = (rows: { requests_used?: number }[] | null) =>
+    (rows ?? []).reduce((s, r) => s + Number(r.requests_used ?? 0), 0);
+
   return {
-    requests: rows.reduce((sum, r) => sum + Number(r.requests_used ?? 0), 0),
-    runs: rows.length,
+    requests: sum(syncRows) + sum(analysisRows),
+    runs: (syncRows?.length ?? 0) + (analysisRows?.length ?? 0),
   };
 }

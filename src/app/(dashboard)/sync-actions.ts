@@ -1,27 +1,28 @@
 "use server";
 
 // ============================================================
-// Importazione partite da API-Football.
+// Importazione partite da API-Football (oggi + domani + dopodomani).
 //
 // Gira SOLO sul server: la chiave `SPORTS_API_KEY` non viene mai
-// esposta al browser. Consuma 1 sola richiesta API per esecuzione
-// (endpoint /fixtures?date=... restituisce tutte le partite del giorno;
-// il filtro sui campionati avviene in locale).
+// esposta al browser. Consuma 1 richiesta API per ogni data (3 in
+// totale), poi filtra i campionati seguiti in locale: niente chiamate
+// partita per partita.
 // ============================================================
 
 import { revalidatePath } from "next/cache";
 
 import { isAdminEmail } from "@/lib/config";
-import { todayIsoDate } from "@/lib/dates";
+import { isoDateOffset, todayIsoDate } from "@/lib/dates";
 import { createClient } from "@/lib/supabase/server";
 import {
-  fetchFixturesByDate,
+  fetchFixturesByDates,
   isSportsApiConfigured,
   SportsApiError,
 } from "@/lib/sports/api-football";
 import type { MatchState, SyncOutcome, SyncRunStatus } from "@/types";
 
 const UPSERT_CHUNK_SIZE = 200;
+const SYNC_DAYS = 3; // oggi + domani + dopodomani
 
 /** Stati API-Football raggruppati secondo il nostro modello. */
 const FINISHED_STATUSES = new Set(["FT", "AET", "PEN", "AWD", "WO"]);
@@ -95,11 +96,11 @@ export async function syncFixtures(): Promise<SyncOutcome> {
     });
   }
 
-  const date = todayIsoDate();
   const userId = user.id;
+  const dates: string[] = [];
+  for (let i = 0; i < SYNC_DAYS; i++) dates.push(i === 0 ? todayIsoDate() : isoDateOffset(i));
 
-  // Il log non deve mai bloccare l'import: se la tabella non esiste
-  // (migrazione non ancora eseguita) semplicemente non registriamo.
+  // Il log non deve mai bloccare l'import.
   async function recordRun(
     status: SyncRunStatus,
     fields: {
@@ -116,7 +117,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
       await supabase.from("api_sync_runs").insert({
         user_id: userId,
         source: "api-football",
-        sync_date: date,
+        sync_date: dates[0],
         requests_used: fields.requestsUsed,
         requests_limit: fields.requestsLimit ?? null,
         requests_remaining: fields.requestsRemaining ?? null,
@@ -132,7 +133,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
   }
 
   try {
-    const result = await fetchFixturesByDate(date);
+    const result = await fetchFixturesByDates(dates);
     const quota = result.quota;
     const pagesNote =
       result.pagesTotal > 1
@@ -141,7 +142,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
 
     if (result.fixtures.length === 0) {
       await recordRun("ok", {
-        requestsUsed: 1,
+        requestsUsed: result.requestsUsed,
         fixturesFound: 0,
         fixturesImported: 0,
         fixturesInserted: 0,
@@ -149,8 +150,6 @@ export async function syncFixtures(): Promise<SyncOutcome> {
         requestsRemaining: quota.requestsRemaining,
       });
 
-      // Diagnostica: elenca i campionati realmente presenti nella risposta,
-      // così si capisce subito se gli ID dei campionati seguiti sono errati.
       const leagueNames = result.leaguesFound
         .slice(0, 15)
         .map((l) => `${l.name} (ID ${l.id})`)
@@ -170,10 +169,10 @@ export async function syncFixtures(): Promise<SyncOutcome> {
         status: "ok",
         message:
           (result.totalReturned === 0
-            ? `Nessuna partita in programma il ${date}.`
-            : `Nessuna partita dei campionati seguiti il ${date} (${result.totalReturned} totali).${diagnostic}`) +
+            ? `Nessuna partita in programma tra ${dates[0]} e ${dates[dates.length - 1]}.`
+            : `Nessuna partita dei campionati seguiti tra ${dates[0]} e ${dates[dates.length - 1]} (${result.totalReturned} totali).${diagnostic}`) +
           pagesNote,
-        requestsUsed: 1,
+        requestsUsed: result.requestsUsed,
         requestsLimit: quota.requestsLimit,
         requestsRemaining: quota.requestsRemaining,
       });
@@ -187,10 +186,13 @@ export async function syncFixtures(): Promise<SyncOutcome> {
       away_team: f.teams.away.name,
       kickoff_at: f.fixture.date,
       status: mapFixtureStatus(f.fixture.status.short),
+      league_id: f.league.id,
+      season: f.league.season,
+      home_team_id: f.teams.home.id,
+      away_team_id: f.teams.away.id,
     }));
 
-    // Quante sono davvero nuove? Serve per non dire "importate" anche
-    // quando in realtà sono solo aggiornate.
+    // Quante sono davvero nuove?
     const { data: existingRows } = await supabase
       .from("matches")
       .select("external_id")
@@ -214,7 +216,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
         const message = hint ?? `Errore nel salvataggio: ${error.message}`;
 
         await recordRun("error", {
-          requestsUsed: 1,
+          requestsUsed: result.requestsUsed,
           fixturesFound: result.fixtures.length,
           fixturesImported: imported,
           fixturesInserted: 0,
@@ -226,7 +228,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
         return outcome({
           status: "error",
           message,
-          requestsUsed: 1,
+          requestsUsed: result.requestsUsed,
           requestsLimit: quota.requestsLimit,
           requestsRemaining: quota.requestsRemaining,
           fixturesFound: result.fixtures.length,
@@ -238,7 +240,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
     }
 
     await recordRun("ok", {
-      requestsUsed: 1,
+      requestsUsed: result.requestsUsed,
       fixturesFound: result.fixtures.length,
       fixturesImported: imported,
       fixturesInserted: inserted,
@@ -253,8 +255,8 @@ export async function syncFixtures(): Promise<SyncOutcome> {
       status: "ok",
       message: `${inserted} nuove partite${
         updated > 0 ? `, ${updated} già presenti e aggiornate` : ""
-      } (${result.fixtures.length} dai campionati seguiti).${pagesNote}`,
-      requestsUsed: 1,
+      } (${result.fixtures.length} dai campionati seguiti, ${dates[0]} → ${dates[dates.length - 1]}).${pagesNote}`,
+      requestsUsed: result.requestsUsed,
       requestsLimit: quota.requestsLimit,
       requestsRemaining: quota.requestsRemaining,
       fixturesFound: result.fixtures.length,
@@ -273,7 +275,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
         : "Errore imprevisto durante l'importazione.";
 
     await recordRun(status, {
-      requestsUsed: 1,
+      requestsUsed: dates.length,
       fixturesFound: 0,
       fixturesImported: 0,
       fixturesInserted: 0,
@@ -283,7 +285,7 @@ export async function syncFixtures(): Promise<SyncOutcome> {
     return outcome({
       status,
       message,
-      requestsUsed: 1,
+      requestsUsed: dates.length,
     });
   }
 }
