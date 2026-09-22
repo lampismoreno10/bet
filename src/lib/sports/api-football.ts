@@ -59,6 +59,8 @@ export interface FixturesResult {
   totalReturned: number;
   /** Numero di pagine dichiarate dall'API (>1 = risultato parziale). */
   pagesTotal: number;
+  /** Campionati distinti presenti nella risposta (utile per la diagnostica). */
+  leaguesFound: { id: number; name: string }[];
   quota: ApiQuotaMeta;
 }
 
@@ -191,10 +193,20 @@ export async function fetchFixturesByDate(date: string): Promise<FixturesResult>
   const fixtures = raw as ApiFootballFixture[];
   const filtered = fixtures.filter((f) => isTrackedLeague(f.league?.id));
 
+  // Campionati distinti presenti nella risposta (per capire cosa è arrivato).
+  const seen = new Map<number, string>();
+  for (const f of fixtures) {
+    if (f.league?.id != null && !seen.has(f.league.id)) {
+      seen.set(f.league.id, f.league.name ?? `ID ${f.league.id}`);
+    }
+  }
+  const leaguesFound = [...seen.entries()].map(([id, name]) => ({ id, name }));
+
   return {
     fixtures: filtered,
     totalReturned: fixtures.length,
     pagesTotal: payload.paging?.total ?? 1,
+    leaguesFound,
     quota,
   };
 }

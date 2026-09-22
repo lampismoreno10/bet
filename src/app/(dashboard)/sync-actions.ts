@@ -149,12 +149,29 @@ export async function syncFixtures(): Promise<SyncOutcome> {
         requestsRemaining: quota.requestsRemaining,
       });
 
+      // Diagnostica: elenca i campionati realmente presenti nella risposta,
+      // così si capisce subito se gli ID dei campionati seguiti sono errati.
+      const leagueNames = result.leaguesFound
+        .slice(0, 15)
+        .map((l) => `${l.name} (ID ${l.id})`)
+        .join(", ");
+      const more =
+        result.leaguesFound.length > 15
+          ? `, +${result.leaguesFound.length - 15} altri`
+          : "";
+      const diagnostic =
+        result.totalReturned === 0
+          ? ""
+          : leagueNames
+            ? ` Campionati presenti nella risposta: ${leagueNames}${more}.`
+            : " Attenzione: le partite non riportano il campo 'league'.";
+
       return outcome({
         status: "ok",
         message:
           (result.totalReturned === 0
             ? `Nessuna partita in programma il ${date}.`
-            : `Nessuna partita dei campionati seguiti il ${date} (l'API ne ha restituite ${result.totalReturned} in totale).`) +
+            : `Nessuna partita dei campionati seguiti il ${date} (${result.totalReturned} totali).${diagnostic}`) +
           pagesNote,
         requestsUsed: 1,
         requestsLimit: quota.requestsLimit,
