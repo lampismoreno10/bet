@@ -6,12 +6,11 @@
 // campionato restituito da /fixtures con questa whitelist. Aggiungere
 // competizioni qui NON aumenta il numero di richieste API.
 //
-// NOTA sugli ID: quelli dei club sono stabili e già verificati. Gli ID
-// delle competizioni per nazionali (soprattutto le qualificazioni 31/32/34)
-// vanno confermati al primo utilizzo reale: la sincronizzazione mostra
-// comunque "Campionati presenti nella risposta" con gli ID reali, così è
-// facile correggerli se non coincidono.
-// Le amichevoli internazionali restano VOLUTAMENTE escluse.
+// NOTA sugli ID: quelli dei club sono stabili e già verificati; gli ID
+// delle nazionali sono verificati direttamente dalla dashboard API-Football.
+// "European Championship" (fase finale) è volutamente omesso finché il suo
+// ID non sarà confermato. Le amichevoli internazionali restano VOLUTAMENTE
+// escluse.
 // ============================================================
 
 export type LeagueKind = "club" | "national";
@@ -35,13 +34,12 @@ export const TRACKED_LEAGUES: TrackedLeague[] = [
   { id: 3, name: "UEFA Europa League", kind: "club" },
   { id: 848, name: "UEFA Conference League", kind: "club" },
 
-  // — NAZIONALI —
+  // — NAZIONALI (ID verificati direttamente da API-Football) —
   { id: 1, name: "FIFA World Cup", kind: "national" },
-  { id: 32, name: "World Cup Qualifiers - Europe", kind: "national" },
-  { id: 34, name: "World Cup Qualifiers - South America", kind: "national" },
+  { id: 32, name: "World Cup - Qualification Europe", kind: "national" },
+  { id: 34, name: "World Cup - Qualification South America", kind: "national" },
   { id: 5, name: "UEFA Nations League", kind: "national" },
-  { id: 4, name: "European Championship", kind: "national" },
-  { id: 31, name: "Euro Qualifiers", kind: "national" },
+  { id: 960, name: "Euro Championship - Qualification", kind: "national" },
   { id: 9, name: "Copa America", kind: "national" },
 ];
 
