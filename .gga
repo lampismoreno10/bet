@@ -4,7 +4,7 @@
 # AI Provider (required)
 # Options: claude, gemini, codex, opencode, cursor[:model], kilo[:model], kiro, ollama:<model>, lmstudio[:model], github:<model>, minimax[:model]
 # Examples:
-#   PROVIDER="ollama:qwen-harness"
+#   PROVIDER="claude"
 #   PROVIDER="gemini"
 #   PROVIDER="codex"
 #   PROVIDER="opencode"
@@ -22,7 +22,7 @@
 #   PROVIDER="github:deepseek-r1"
 #   PROVIDER="minimax"
 #   PROVIDER="minimax:MiniMax-M3"
-PROVIDER="ollama:qwen-harness"
+PROVIDER="claude"
 
 # File patterns to include in review (comma-separated)
 # Default: * (all files)
