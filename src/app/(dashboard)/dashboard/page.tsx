@@ -1,17 +1,24 @@
 import Link from "next/link";
 
+import { ImportedFixturesList } from "@/components/imported-fixtures-list";
 import { MatchCard } from "@/components/match-card";
 import { StatCard } from "@/components/stat-card";
-import { isDemoMode } from "@/lib/config";
+import { SyncFixturesPanel } from "@/components/sync-fixtures-panel";
+import { isAdminEmail, isDemoMode } from "@/lib/config";
 import {
   computeBankroll,
   getBankrollTransactions,
   getBets,
   getCandidateMatches,
+  getFixturesWithoutAnalysis,
+  getLastSyncRun,
+  getTodayApiUsage,
 } from "@/lib/data";
 import { currentMonthPeriod, isToday, monthPeriodOf } from "@/lib/dates";
 import { formatEuro, formatPercent } from "@/lib/format";
 import { computeStats } from "@/lib/stats";
+import { createClient } from "@/lib/supabase/server";
+import type { Match, SyncRun } from "@/types";
 
 export const dynamic = "force-dynamic";
 
@@ -23,6 +30,28 @@ export default async function DashboardPage() {
     getBets(),
     getBankrollTransactions(),
   ]);
+
+  let isAdmin = false;
+  let importedFixtures: Match[] = [];
+  let lastRun: SyncRun | null = null;
+  let todayUsage = { requests: 0, runs: 0 };
+
+  if (!demo) {
+    const supabase = await createClient();
+    const {
+      data: { user },
+    } = await supabase.auth.getUser();
+    isAdmin = isAdminEmail(user?.email);
+
+    const [imported, run, usage] = await Promise.all([
+      getFixturesWithoutAnalysis(),
+      getLastSyncRun(),
+      getTodayApiUsage(),
+    ]);
+    importedFixtures = imported;
+    lastRun = run;
+    todayUsage = usage;
+  }
 
   const bets = records.map((r) => r.bet);
   const stats = computeStats(bets, 0);
@@ -84,6 +113,16 @@ export default async function DashboardPage() {
         />
       </div>
 
+      {!demo && (
+        <div className="mt-6">
+          <SyncFixturesPanel
+            isAdmin={isAdmin}
+            lastRun={lastRun}
+            todayRequests={todayUsage.requests}
+          />
+        </div>
+      )}
+
       <div className="mb-4 mt-8 flex items-end justify-between">
         <h2 className="text-lg font-semibold tracking-tight text-zinc-100">
           Partite candidate
@@ -97,8 +136,8 @@ export default async function DashboardPage() {
             Nessuna partita candidata
           </p>
           <p className="mx-auto mt-1 max-w-md text-sm text-zinc-500">
-            Aggiungi la tua prima partita con la relativa analisi: quota equa ed
-            EV vengono calcolati automaticamente.
+            Aggiungi una partita con la relativa analisi, oppure importa le
+            partite di oggi con &quot;Aggiorna partite&quot;.
           </p>
           <Link href="/matches/new" className="btn-primary mt-4">
             + Nuova partita
@@ -110,6 +149,26 @@ export default async function DashboardPage() {
             <MatchCard key={item.match.id} item={item} isDemo={demo} />
           ))}
         </div>
+      )}
+
+      {importedFixtures.length > 0 && (
+        <>
+          <div className="mb-4 mt-8 flex items-end justify-between">
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-zinc-100">
+                Partite importate
+              </h2>
+              <p className="text-sm text-zinc-500">
+                In attesa di analisi
+              </p>
+            </div>
+            <span className="text-sm text-zinc-500">
+              {importedFixtures.length} partite
+            </span>
+          </div>
+
+          <ImportedFixturesList matches={importedFixtures} />
+        </>
       )}
     </div>
   );

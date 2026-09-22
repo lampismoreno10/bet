@@ -21,5 +21,22 @@ export function isDemoMode(): boolean {
   return !isSupabaseConfigured();
 }
 
+/**
+ * Controllo accesso admin per le funzioni di importazione.
+ * Se `ADMIN_EMAILS` non è impostata, qualsiasi utente autenticato è admin
+ * (comodo in sviluppo). In produzione conviene valorizzarla con la lista
+ * delle email separate da virgola.
+ */
+export function isAdminEmail(email: string | null | undefined): boolean {
+  const list = (process.env.ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (list.length === 0) return true;
+  if (!email) return false;
+  return list.includes(email.toLowerCase());
+}
+
 export const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";
 export const SUPABASE_ANON_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ?? "";

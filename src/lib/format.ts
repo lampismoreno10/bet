@@ -1,6 +1,12 @@
 // ============================================================
 // Formattatori (formato italiano).
+//
+// Tutti i formati che coinvolgono date forzano `timeZone: TIME_ZONE`:
+// in produzione il server (Vercel) gira in UTC, quindi senza questo gli
+// orari delle partite risulterebbero spostati di 1-2 ore.
 // ============================================================
+
+import { TIME_ZONE } from "@/lib/dates";
 
 const euroFormatter = new Intl.NumberFormat("it-IT", {
   style: "currency",
@@ -53,6 +59,7 @@ export function formatDate(iso: string | null | undefined): string {
     day: "2-digit",
     month: "2-digit",
     year: "numeric",
+    timeZone: TIME_ZONE,
   });
 }
 
@@ -64,6 +71,7 @@ export function formatDateTime(iso: string | null | undefined): string {
     year: "numeric",
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: TIME_ZONE,
   });
 }
 
@@ -73,5 +81,6 @@ export function formatTime(iso: string | null | undefined): string {
   return new Date(iso).toLocaleTimeString("it-IT", {
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: TIME_ZONE,
   });
 }

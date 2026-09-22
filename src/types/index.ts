@@ -128,3 +128,40 @@ export interface BetRecord {
   bet: Bet;
   match: Match;
 }
+
+// ------------------------------------------------------------
+// Importazione partite da API-Football
+// ------------------------------------------------------------
+
+export type SyncRunStatus = "ok" | "error" | "quota_exceeded";
+
+/** Una sincronizzazione registrata (per controllare la quota API giornaliera). */
+export interface SyncRun {
+  id: string;
+  source: string;
+  syncDate: string;
+  requestsUsed: number;
+  requestsLimit: number | null;
+  requestsRemaining: number | null;
+  fixturesFound: number;
+  fixturesImported: number;
+  fixturesInserted: number;
+  status: SyncRunStatus;
+  errorMessage: string | null;
+  createdAt: string;
+}
+
+/** Esito restituito dalla server action al pulsante "Aggiorna partite". */
+export interface SyncOutcome {
+  ok: boolean;
+  status: SyncRunStatus;
+  message: string;
+  requestsUsed: number;
+  requestsLimit: number | null;
+  requestsRemaining: number | null;
+  fixturesFound: number;
+  /** Righe inviate all'upsert (nuove + aggiornate). */
+  fixturesImported: number;
+  /** Solo le partite realmente nuove. */
+  fixturesInserted: number;
+}

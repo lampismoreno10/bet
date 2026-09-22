@@ -17,6 +17,11 @@ const dayFmt = new Intl.DateTimeFormat("en-CA", {
   day: "2-digit",
 });
 
+/** Data odierna in formato "YYYY-MM-DD" (timezone Europa/Roma). */
+export function todayIsoDate(now: Date = new Date()): string {
+  return dayFmt.format(now);
+}
+
 /** Periodo mensile "YYYY-MM" di una data ISO. */
 export function monthPeriodOf(iso: string): string {
   const d = new Date(iso);

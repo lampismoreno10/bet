@@ -6,6 +6,7 @@
 
 import { createClient } from "@/lib/supabase/server";
 import { isDemoMode } from "@/lib/config";
+import { todayIsoDate } from "@/lib/dates";
 import {
   demoAnalyses,
   demoBankrollTransactions,
@@ -24,6 +25,7 @@ import type {
   CandidateMatch,
   Match,
   ModelVersion,
+  SyncRun,
 } from "@/types";
 
 // ------------------------------------------------------------
@@ -103,6 +105,24 @@ function mapModelVersion(row: any): ModelVersion {
     description: row.description ?? undefined,
     parameters: row.parameters ?? undefined,
     active: row.active,
+    createdAt: row.created_at,
+  };
+}
+
+function mapSyncRun(row: any): SyncRun {
+  return {
+    id: row.id,
+    source: row.source,
+    syncDate: row.sync_date,
+    requestsUsed: Number(row.requests_used ?? 0),
+    requestsLimit: row.requests_limit != null ? Number(row.requests_limit) : null,
+    requestsRemaining:
+      row.requests_remaining != null ? Number(row.requests_remaining) : null,
+    fixturesFound: Number(row.fixtures_found ?? 0),
+    fixturesImported: Number(row.fixtures_imported ?? 0),
+    fixturesInserted: Number(row.fixtures_inserted ?? 0),
+    status: row.status,
+    errorMessage: row.error_message ?? null,
     createdAt: row.created_at,
   };
 }
@@ -239,4 +259,72 @@ export async function getModelVersions(): Promise<ModelVersion[]> {
 /** Bankroll corrente = somma delle transazioni. */
 export function computeBankroll(transactions: BankrollTransaction[]): number {
   return transactions.reduce((sum, t) => sum + t.amount, 0);
+}
+
+// ------------------------------------------------------------
+// Partite importate da fonti esterne (API-Football)
+// ------------------------------------------------------------
+
+/**
+ * Partite importate (con `external_id`) che non hanno ancora un'analisi.
+ * Sono quelle che l'import ha appena salvato e che attendono di essere
+ * analizzate.
+ */
+export async function getFixturesWithoutAnalysis(limit = 60): Promise<Match[]> {
+  if (isDemoMode()) return [];
+
+  const supabase = await createClient();
+  const [{ data: matches }, { data: analyses }] = await Promise.all([
+    supabase
+      .from("matches")
+      .select("*")
+      .not("external_id", "is", null)
+      // DESC: le partite appena importate (le più recenti) vengono per prime.
+      // Il taglio a `limit` va fatto DOPO aver escluso quelle già analizzate,
+      // altrimenti le partite vecchie riempirebbero la finestra.
+      .order("kickoff_at", { ascending: false })
+      .limit(300),
+    supabase.from("analyses").select("match_id"),
+  ]);
+
+  const analyzed = new Set((analyses ?? []).map((a) => a.match_id));
+  return (matches ?? [])
+    .filter((m) => !analyzed.has(m.id))
+    .slice(0, limit)
+    .map(mapMatch);
+}
+
+/** Ultima sincronizzazione registrata (null se mai eseguita). */
+export async function getLastSyncRun(): Promise<SyncRun | null> {
+  if (isDemoMode()) return null;
+
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("api_sync_runs")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return data ? mapSyncRun(data) : null;
+}
+
+/** Chiamate API consumate oggi (per controllare il limite giornaliero). */
+export async function getTodayApiUsage(): Promise<{
+  requests: number;
+  runs: number;
+}> {
+  if (isDemoMode()) return { requests: 0, runs: 0 };
+
+  const supabase = await createClient();
+  const { data } = await supabase
+    .from("api_sync_runs")
+    .select("requests_used")
+    .eq("sync_date", todayIsoDate());
+
+  const rows = data ?? [];
+  return {
+    requests: rows.reduce((sum, r) => sum + Number(r.requests_used ?? 0), 0),
+    runs: rows.length,
+  };
 }
