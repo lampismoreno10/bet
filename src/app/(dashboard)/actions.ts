@@ -8,41 +8,35 @@
 import { revalidatePath } from "next/cache";
 
 import { createClient } from "@/lib/supabase/server";
+import {
+  asBookmakerOdds,
+  computeEv,
+  computeFairOdds,
+} from "@/lib/sports/markets";
 import type { AnalysisInput, AnalysisState, MatchInput } from "@/types";
-
-/**
- * Quota bookmaker valida (> 1) oppure null.
- * Non si inventa mai una quota: campo vuoto, 0 o un valore <= 1 restano assenti.
- */
-function asBookmakerOdds(value: number | null | undefined): number | null {
-  return value != null && Number.isFinite(value) && value > 1 ? value : null;
-}
 
 /**
  * Quota bookmaker normalizzata, quota equa ed EV.
  * La quota equa è calcolabile dalla probabilità stimata; l'EV NO: senza una
  * quota bookmaker reale non esiste, quindi resta null (mai 0, mai -1).
+ * La matematica è condivisa con la pipeline di analisi (lib/sports/markets).
  */
 function derive(probability: number, bookmakerOdds: number | null | undefined) {
   const odds = asBookmakerOdds(bookmakerOdds);
-  const fairOdds = probability > 0 ? 1 / probability : 0;
-  const ev =
-    odds != null && probability > 0
-      ? Number((probability * odds - 1).toFixed(4))
-      : null;
-
   return {
     odds,
-    fairOdds: Number(fairOdds.toFixed(2)),
-    ev,
+    fairOdds: computeFairOdds(probability),
+    ev: computeEv(probability, odds),
   };
 }
 
 /**
  * Segna una partita come "giocata":
- * 1. crea una bet (stato open) con i dati dell'analisi;
- * 2. aggiorna lo stato dell'analisi a "giocata".
- * La bet entra così automaticamente nel report/archivio.
+ * 1. verifica che l'analisi sia realmente giocabile e abbia una QUOTA REALE;
+ * 2. verifica che non esista già una giocata per la stessa analisi;
+ * 3. crea la bet (stato open) e porta l'analisi a "giocata".
+ *
+ * Non è più possibile creare una giocata con quota 0 o inventata.
  */
 export async function markAsPlayed(
   matchId: string,
@@ -61,19 +55,58 @@ export async function markAsPlayed(
     .maybeSingle();
   if (analysisError || !analysis) return { error: "Analisi non trovata" };
 
+  // 1) coerenza analisi <-> partita (entrambi arrivano dal client).
+  if (analysis.match_id !== matchId) {
+    return { error: "L'analisi non appartiene a questa partita." };
+  }
+
+  // 2) serve una QUOTA BOOKMAKER REALE (> 1): mai odds = 0.
+  const realOdds = asBookmakerOdds(
+    analysis.bet365_odds != null ? Number(analysis.bet365_odds) : null
+  );
+  if (realOdds == null) {
+    return {
+      error:
+        "Quota bookmaker reale assente: la giocata non può essere registrata (nessuna quota inventata).",
+    };
+  }
+
+  // 3) l'analisi deve essere realmente giocabile.
+  if (analysis.state !== "giocabile") {
+    return {
+      error: `L'analisi non è giocabile (stato attuale: ${analysis.state}).`,
+    };
+  }
+
+  // 4) nessuna giocata duplicata per la stessa analisi.
+  const { data: existing } = await supabase
+    .from("bets")
+    .select("id")
+    .eq("analysis_id", analysisId)
+    .limit(1);
+  if (existing && existing.length > 0) {
+    return { error: "Esiste già una giocata per questa analisi." };
+  }
+
   const { error: betError } = await supabase.from("bets").insert({
     user_id: user.id,
     match_id: matchId,
     analysis_id: analysisId,
     market: analysis.market,
     selection: analysis.selection,
-    odds: analysis.bet365_odds ?? 0,
+    odds: realOdds,
     ev: analysis.ev ?? 0,
     stake: 0, // importo impostabile in fase di chiusura
     status: "open",
     profit: 0,
   });
-  if (betError) return { error: betError.message };
+  if (betError) {
+    // 23505 = violazione del vincolo unique (user_id, analysis_id).
+    if (betError.code === "23505") {
+      return { error: "Esiste già una giocata per questa analisi." };
+    }
+    return { error: betError.message };
+  }
 
   const { error: updateError } = await supabase
     .from("analyses")
@@ -280,6 +313,14 @@ export async function settleBet(
     .maybeSingle();
   if (betError || !bet) return { error: "Giocata non trovata" };
 
+  // Nessun settlement doppio: si chiude solo una giocata ancora aperta.
+  if (bet.status !== "open") {
+    return { error: `La giocata è già stata chiusa (stato: ${bet.status}).` };
+  }
+  if (!Number.isFinite(stake) || stake < 0) {
+    return { error: "Importo non valido." };
+  }
+
   const odds = Number(bet.odds) || 1;
   const profit =
     status === "won" ? stake * (odds - 1) : status === "lost" ? -stake : 0;
@@ -292,7 +333,9 @@ export async function settleBet(
       profit,
       settled_at: new Date().toISOString(),
     })
-    .eq("id", betId);
+    .eq("id", betId)
+    .eq("user_id", user.id)
+    .eq("status", "open"); // guardia contro la doppia chiusura
   if (error) return { error: error.message };
 
   revalidatePath("/", "layout");

@@ -77,7 +77,7 @@ function analysisResult(res: AnalysisOutcome): OpResult {
   return {
     message: res.message,
     tone: res.status === "ok" ? "ok" : res.status === "partial" ? "partial" : "error",
-    detail: `Richieste API: ${res.requestsUsed} · DeepSeek: ${res.deepseekCalls} · analisi create: ${res.analysesCreated}${
+    detail: `Richieste API effettuate: ${res.requestsUsed} · DeepSeek: ${res.deepseekCalls} · OpenFootball: ${res.openFootball} · fallback API: ${res.apiFallback} · quote reali: ${res.oddsFound} · analisi create: ${res.analysesCreated}${
       res.errors.length ? ` · errori: ${res.errors.length}` : ""
     }`,
   };
@@ -87,7 +87,9 @@ function resultsResult(res: ResultsOutcome): OpResult {
   return {
     message: res.message,
     tone: res.ok ? "ok" : "error",
-    detail: `Richieste API: ${res.requestsUsed} · aggiornate: ${res.updated} · terminate: ${res.finished}`,
+    detail: `Richieste API effettuate: ${res.requestsUsed} · aggiornate: ${res.updated} · terminate: ${res.finished} · giocate chiuse: ${res.settled}${
+      res.leftOpen ? ` · non liquidabili: ${res.leftOpen}` : ""
+    }`,
   };
 }
 
@@ -183,9 +185,9 @@ export function ControlPanel({
       {/* Stato operazioni */}
       <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
         <StatusItem label="Ultimo aggiornamento" value={status.lastSyncAt ? formatDateTime(status.lastSyncAt) : "—"} />
-        <StatusItem label="Quota giornaliera" value={status.quotaLimit != null ? String(status.quotaLimit) : "N/D"} />
-        <StatusItem label="Richieste residue" value={status.quotaRemaining != null ? String(status.quotaRemaining) : "N/D"} />
-        <StatusItem label="Richieste usate oggi" value={String(status.todayRequests)} />
+        <StatusItem label="Quota reale (header API)" value={status.quotaLimit != null ? String(status.quotaLimit) : "N/D"} />
+        <StatusItem label="Residue reali (header API)" value={status.quotaRemaining != null ? String(status.quotaRemaining) : "N/D"} />
+        <StatusItem label="Tentativi loggati oggi" value={String(status.todayRequests)} />
         <StatusItem label="Partite trovate" value={status.lastSyncFound != null ? String(status.lastSyncFound) : "—"} />
         <StatusItem label="Partite analizzate" value={status.lastAnalysisAnalyzed != null ? String(status.lastAnalysisAnalyzed) : "—"} />
         <StatusItem label="Analisi create" value={status.lastAnalysisCreated != null ? String(status.lastAnalysisCreated) : "—"} />

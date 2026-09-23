@@ -22,10 +22,12 @@ export function isDemoMode(): boolean {
 }
 
 /**
- * Controllo accesso admin per le funzioni di importazione.
- * Se `ADMIN_EMAILS` non è impostata, qualsiasi utente autenticato è admin
- * (comodo in sviluppo). In produzione conviene valorizzarla con la lista
- * delle email separate da virgola.
+ * Controllo accesso admin per le funzioni di importazione e analisi.
+ *
+ * In PRODUZIONE una whitelist vuota NON abilita nessun admin: altrimenti
+ * qualsiasi utente autenticato potrebbe consumare la quota API-Football e le
+ * chiamate DeepSeek. In sviluppo si mantiene il comportamento comodo
+ * (nessuna whitelist => tutti admin), ma solo fuori dalla produzione.
  */
 export function isAdminEmail(email: string | null | undefined): boolean {
   const list = (process.env.ADMIN_EMAILS ?? "")
@@ -33,9 +35,17 @@ export function isAdminEmail(email: string | null | undefined): boolean {
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
 
-  if (list.length === 0) return true;
+  if (list.length === 0) return process.env.NODE_ENV !== "production";
   if (!email) return false;
   return list.includes(email.toLowerCase());
+}
+
+/** True se la whitelist admin è configurata (per diagnostica/UI). */
+export function isAdminWhitelistConfigured(): boolean {
+  return (process.env.ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((e) => e.trim())
+    .filter(Boolean).length > 0;
 }
 
 export const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "";

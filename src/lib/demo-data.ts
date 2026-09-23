@@ -73,6 +73,8 @@ function analysis(
     confidence,
     risks,
     state,
+    source: "openfootball",
+    bookmaker: "Bet365 (DEMO)",
     isDemo: true,
   };
 }

@@ -1,28 +1,105 @@
 // ============================================================
-// Fonte dati alternativa: OpenFootball / football.json
+// Fonte statistica PRIMARIA: OpenFootball / football.json
 //
 // ⚠️ Questo modulo NON effettua alcuna chiamata ad API-Football.
-// API-Football resta riservata alla sincronizzazione delle partite.
 //
 // Fonte: https://github.com/openfootball/football.json
-// Licenza: CC0 / public domain. Nessuna API key.
-//
-// Per ora è supportata ESCLUSIVAMENTE la Serie A italiana 2026/27.
+// Licenza: CC0 / public domain. Nessuna API key. Nessuno scraping HTML.
 //
 // Tutte le statistiche sono calcolate LOCALMENTE dal JSON, usando solo le
 // partite che hanno già un risultato finale (`score.ft`). Nessun dato viene
 // inventato: se un'informazione non è nel dataset, non viene prodotta.
 //
-// Il dataset è un file statico su raw.githubusercontent.com: viene scaricato
-// UNA sola volta per esecuzione (con cache in memoria e dedup delle chiamate
-// concorrenti), mai una volta per partita.
+// I dataset sono file statici su raw.githubusercontent.com: ogni dataset
+// viene scaricato UNA sola volta per esecuzione (cache in memoria per lega
+// + dedup delle chiamate concorrenti), mai una volta per partita.
+//
+// ⚠️ Gli URL sotto sono stati VERIFICATI uno per uno. La Serie B 2026/27
+// NON esiste nel repository (HTTP 404) e quindi non è configurata.
 // ============================================================
 
-export const OPENFOOTBALL_SERIE_A_2026_27_URL =
-  "https://raw.githubusercontent.com/openfootball/football.json/master/2026-27/it.1.json";
+/** Stagione coperta dai dataset configurati (2026/27). */
+export const OPENFOOTBALL_SEASON = 2026;
+
+export interface OpenFootballDataset {
+  /** URL raw del dataset (verificato). */
+  url: string;
+  /** Etichetta leggibile della competizione. */
+  label: string;
+}
+
+const FOOTBALL_JSON_BASE =
+  "https://raw.githubusercontent.com/openfootball/football.json/master/2026-27";
+
+/**
+ * Configurazione CENTRALIZZATA: id lega API-Football -> dataset OpenFootball.
+ *
+ * Aggiungere una competizione qui la abilita automaticamente in tutta la
+ * pipeline: nessuna logica duplicata per campionato.
+ */
+export const OPENFOOTBALL_DATASETS: Record<number, OpenFootballDataset> = {
+  135: { url: `${FOOTBALL_JSON_BASE}/it.1.json`, label: "Serie A 2026/27" },
+  39: { url: `${FOOTBALL_JSON_BASE}/en.1.json`, label: "Premier League 2026/27" },
+  40: { url: `${FOOTBALL_JSON_BASE}/en.2.json`, label: "Championship 2026/27" },
+  140: { url: `${FOOTBALL_JSON_BASE}/es.1.json`, label: "La Liga 2026/27" },
+  78: { url: `${FOOTBALL_JSON_BASE}/de.1.json`, label: "Bundesliga 2026/27" },
+  61: { url: `${FOOTBALL_JSON_BASE}/fr.1.json`, label: "Ligue 1 2026/27" },
+};
+
+/** True se esiste un dataset OpenFootball per questa lega e stagione. */
+export function hasOpenFootballDataset(
+  leagueId: number | null | undefined,
+  season: number | null | undefined
+): boolean {
+  if (leagueId == null || !(leagueId in OPENFOOTBALL_DATASETS)) return false;
+  return season == null || season === OPENFOOTBALL_SEASON;
+}
+
+/** Etichetta della competizione, se coperta da OpenFootball. */
+export function openFootballLabel(leagueId: number | null | undefined): string | null {
+  if (leagueId == null) return null;
+  return OPENFOOTBALL_DATASETS[leagueId]?.label ?? null;
+}
 
 /** Durata della cache in memoria: evita di riscaricare lo stesso JSON. */
 export const OPENFOOTBALL_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minuti
+
+// ------------------------------------------------------------
+// Vocabolario condiviso del contesto: prodotto da questo modulo,
+// consumato dal costruttore del prompt. Le percentuali sono 0..1.
+// ------------------------------------------------------------
+export interface TeamStatistics {
+  form: string | null;
+  goalsFor: number | null;
+  goalsAgainst: number | null;
+  wins: number | null;
+  draws: number | null;
+  losses: number | null;
+  played?: number | null;
+  points?: number | null;
+  rank?: number | null;
+  goalDifference?: number | null;
+  avgGoalsFor?: number | null;
+  avgGoalsAgainst?: number | null;
+  /** Forma nelle partite in casa / in trasferta (es. "WWDLW"). */
+  homeForm?: string | null;
+  awayForm?: string | null;
+  over15?: number | null;
+  over25?: number | null;
+  under45?: number | null;
+  btts?: number | null;
+  /** Ultime 5 partite giocate, già formattate per il prompt. */
+  last5?: string[] | null;
+}
+
+export interface StandingRow {
+  rank: number;
+  team: string;
+  points: number;
+  played?: number | null;
+  goalDifference?: number | null;
+}
+
 
 export class OpenFootballError extends Error {
   constructor(message: string) {
@@ -86,6 +163,10 @@ export interface OpenFootballTeamStats {
 
 export interface OpenFootballLeague {
   league: string;
+  /** Id lega API-Football a cui questo dataset è associato. */
+  leagueId: number;
+  /** Etichetta della competizione (dalla configurazione centralizzata). */
+  datasetLabel: string;
   sourceUrl: string;
   fetchedAt: number;
   /** Partite con risultato finale presenti nel dataset. */
@@ -279,7 +360,12 @@ function toTeamStats(acc: Accumulator): OpenFootballTeamStats {
 }
 
 /** Costruisce il modello della lega a partire dal JSON grezzo. */
-export function buildLeagueFromJson(raw: unknown, fetchedAt = Date.now()): OpenFootballLeague {
+export function buildLeagueFromJson(
+  raw: unknown,
+  dataset: OpenFootballDataset,
+  leagueId: number,
+  fetchedAt = Date.now()
+): OpenFootballLeague {
   const played = extractPlayedMatches(raw);
   const byTeam = accumulate(played);
 
@@ -298,8 +384,10 @@ export function buildLeagueFromJson(raw: unknown, fetchedAt = Date.now()): OpenF
   });
 
   return {
-    league: asString((raw as { name?: unknown } | null)?.name) ?? "OpenFootball",
-    sourceUrl: OPENFOOTBALL_SERIE_A_2026_27_URL,
+    league: asString((raw as { name?: unknown } | null)?.name) ?? dataset.label,
+    leagueId,
+    datasetLabel: dataset.label,
+    sourceUrl: dataset.url,
     fetchedAt,
     playedMatches: played.length,
     teams: new Map(standings.map((team) => [team.team, team])),
@@ -311,41 +399,59 @@ export function buildLeagueFromJson(raw: unknown, fetchedAt = Date.now()): OpenF
 // Download con cache in memoria (una sola fetch per esecuzione)
 // ------------------------------------------------------------
 
-let cachedLeague: OpenFootballLeague | null = null;
-let inFlight: Promise<OpenFootballLeague> | null = null;
+const cache = new Map<number, OpenFootballLeague>();
+const inFlight = new Map<number, Promise<OpenFootballLeague>>();
 
-/** True se la cache in memoria è ancora valida. */
-export function isOpenFootballCacheFresh(now = Date.now()): boolean {
-  return (
-    cachedLeague !== null &&
-    now - cachedLeague.fetchedAt < OPENFOOTBALL_CACHE_TTL_MS
-  );
+/** True se il dataset di quella lega è in cache e ancora fresco. */
+export function isOpenFootballCacheFresh(
+  leagueId: number,
+  now = Date.now()
+): boolean {
+  const cached = cache.get(leagueId);
+  return cached != null && now - cached.fetchedAt < OPENFOOTBALL_CACHE_TTL_MS;
 }
 
 /** Solo per i test: azzera la cache. */
 export function clearOpenFootballCache(): void {
-  cachedLeague = null;
-  inFlight = null;
+  cache.clear();
+  inFlight.clear();
+}
+
+/** Leghe attualmente in cache (diagnostica). */
+export function cachedLeagueIds(): number[] {
+  return [...cache.keys()];
 }
 
 /**
- * Carica il dataset della Serie A 2026/27.
+ * Carica il dataset OpenFootball di una lega.
  *
  * - restituisce la cache in memoria se ancora fresca (nessuna richiesta HTTP);
- * - altrimenti effettua UNA sola richiesta HTTP, condivisa fra chiamate
- *   concorrenti (dedup tramite la promise in volo);
- * - lancia `OpenFootballError` in caso di errore: il chiamante decide come
- *   degradare (le partite restano in attesa).
+ * - altrimenti effettua UNA sola richiesta HTTP per dataset, condivisa fra
+ *   chiamate concorrenti (dedup tramite la promise in volo);
+ * - lancia `OpenFootballError` se la lega non è coperta o se il download
+ *   fallisce: il chiamante decide come degradare (le partite restano in
+ *   attesa, nessun dato inventato).
  */
-export async function loadSerieA2026_27(): Promise<OpenFootballLeague> {
-  if (isOpenFootballCacheFresh()) return cachedLeague as OpenFootballLeague;
-  if (inFlight) return inFlight;
+export async function loadLeague(leagueId: number): Promise<OpenFootballLeague> {
+  const dataset = OPENFOOTBALL_DATASETS[leagueId];
+  if (!dataset) {
+    throw new OpenFootballError(
+      `Nessun dataset OpenFootball configurato per la lega ${leagueId}.`
+    );
+  }
 
-  inFlight = (async () => {
+  if (isOpenFootballCacheFresh(leagueId)) {
+    return cache.get(leagueId) as OpenFootballLeague;
+  }
+
+  const pending = inFlight.get(leagueId);
+  if (pending) return pending;
+
+  const request = (async () => {
     try {
       let response: Response;
       try {
-        response = await fetch(OPENFOOTBALL_SERIE_A_2026_27_URL, { cache: "no-store" });
+        response = await fetch(dataset.url, { cache: "no-store" });
       } catch (err) {
         throw new OpenFootballError(
           `Impossibile contattare OpenFootball: ${
@@ -356,7 +462,7 @@ export async function loadSerieA2026_27(): Promise<OpenFootballLeague> {
 
       if (!response.ok) {
         throw new OpenFootballError(
-          `OpenFootball ha risposto con HTTP ${response.status}.`
+          `OpenFootball ha risposto con HTTP ${response.status} per ${dataset.label}.`
         );
       }
 
@@ -369,15 +475,16 @@ export async function loadSerieA2026_27(): Promise<OpenFootballLeague> {
         );
       }
 
-      const league = buildLeagueFromJson(raw);
-      cachedLeague = league;
+      const league = buildLeagueFromJson(raw, dataset, leagueId);
+      cache.set(leagueId, league);
       return league;
     } finally {
-      inFlight = null;
+      inFlight.delete(leagueId);
     }
   })();
 
-  return inFlight;
+  inFlight.set(leagueId, request);
+  return request;
 }
 
 // ------------------------------------------------------------
@@ -391,21 +498,97 @@ export async function loadSerieA2026_27(): Promise<OpenFootballLeague> {
 // un nome sconosciuto NON viene mai associato a una squadra a caso.
 // ------------------------------------------------------------
 
-/** Token che non identificano la squadra (forme societarie e anni di fondazione). */
+/**
+ * Token che NON identificano la squadra: forme societarie, suffissi e anni.
+ * Rimuoverli è sicuro perché non distinguono due squadre della stessa
+ * competizione. Restano invece INTATTI i token identitari (City, United,
+ * Real, Atlético, Borussia, Sporting, Racing, ...).
+ */
 const LEGAL_TOKENS = new Set([
-  "ac", "as", "ss", "ssc", "us", "fc", "cfc", "bc", "acf", "sc",
-  "calcio", "srl", "spa",
-  "1893", "1899", "1907", "1908", "1909", "1913",
+  // italiano
+  "ac", "as", "ss", "ssc", "us", "fc", "cfc", "bc", "acf", "sc", "calcio",
+  "srl", "spa",
+  // inglese
+  "afc",
+  // spagnolo
+  "ca", "cf", "rc", "rcd", "ud", "cd", "sd", "club", "de", "futbol",
+  "balompie", "deportivo",
+  // tedesco
+  "sv", "vfb", "vfl", "tsg", "bsc", "fsv",
+  // francese
+  "aj", "es", "osc", "ogc", "sco",
 ]);
 
-/** Alias espliciti: chiave = variante, valore = nome canonico OpenFootball. */
+/**
+ * Alias espliciti: chiave = variante normalizzata, valore = nome canonico
+ * OpenFootball. Servono SOLO dove API-Football usa un nome più corto o
+ * diverso da quello del dataset.
+ *
+ * L'alias è applicato solo se il nome canonico esiste nella lega caricata:
+ * un alias di un'altra competizione viene ignorato, quindi non può
+ * attribuire le statistiche alla squadra sbagliata.
+ */
 const TEAM_ALIASES: Record<string, string> = {
+  // Serie A
   inter: "FC Internazionale Milano",
   internazionale: "FC Internazionale Milano",
   "inter milan": "FC Internazionale Milano",
+
+  // Premier League
+  brighton: "Brighton & Hove Albion FC",
+  wolves: "Wolverhampton Wanderers FC",
+  tottenham: "Tottenham Hotspur FC",
+  spurs: "Tottenham Hotspur FC",
+  newcastle: "Newcastle United FC",
+  "west ham": "West Ham United FC",
+  leeds: "Leeds United FC",
+  ipswich: "Ipswich Town FC",
+  coventry: "Coventry City FC",
+  hull: "Hull City AFC",
+
+  // Championship
+  qpr: "Queens Park Rangers FC",
+  "west brom": "West Bromwich Albion FC",
+  "west bromwich": "West Bromwich Albion FC",
+  stoke: "Stoke City FC",
+  swansea: "Swansea City AFC",
+  cardiff: "Cardiff City FC",
+  birmingham: "Birmingham City FC",
+  derby: "Derby County FC",
+  norwich: "Norwich City FC",
+  lincoln: "Lincoln City FC",
+  bolton: "Bolton Wanderers FC",
+  blackburn: "Blackburn Rovers FC",
+  preston: "Preston North End FC",
+  charlton: "Charlton Athletic FC",
+
+  // La Liga
+  espanyol: "RCD Espanyol de Barcelona",
+  "rayo vallecano": "Rayo Vallecano de Madrid",
+  "racing santander": "Real Racing Club de Santander",
+
+  // Bundesliga
+  cologne: "1. FC Köln",
+  "bayern munich": "FC Bayern München",
+  munich: "FC Bayern München",
+  gladbach: "Borussia Mönchengladbach",
+  "borussia monchengladbach": "Borussia Mönchengladbach",
+
+  // Ligue 1
+  marseille: "Olympique de Marseille",
+  lyon: "Olympique Lyonnais",
+  strasbourg: "RC Strasbourg Alsace",
+  rennes: "Stade Rennais FC 1901",
+  brest: "Stade Brestois 29",
+  lens: "Racing Club de Lens",
+  psg: "Paris Saint-Germain FC",
+  "paris sg": "Paris Saint-Germain FC",
 };
 
-/** Normalizza un nome squadra per il confronto. */
+/**
+ * Normalizza un nome squadra per il confronto: minuscole, accenti rimossi,
+ * punteggiatura trasformata in spazi, token societari e anni eliminati.
+ */
 export function normalizeTeamName(name: string): string {
   return name
     .normalize("NFD")
@@ -413,7 +596,12 @@ export function normalizeTeamName(name: string): string {
     .toLowerCase()
     .replace(/[^a-z0-9 ]+/g, " ")
     .split(/\s+/)
-    .filter((token) => token.length > 0 && !LEGAL_TOKENS.has(token))
+    .filter(
+      (token) =>
+        token.length > 0 &&
+        !LEGAL_TOKENS.has(token) &&
+        !/^\d+$/.test(token) // anni di fondazione e numeri societari ("1.", "04")
+    )
     .join(" ")
     .trim();
 }

@@ -4,49 +4,43 @@
 // ⚠️ `DEEPSEEK_API_KEY` NON deve avere prefisso NEXT_PUBLIC_ e questo
 // modulo non deve essere importato da Client Component.
 //
-// DeepSeek espone un'API compatibile con OpenAI (chat completions).
-// Chiediamo JSON strutturato (response_format json_object) e poi
-// validiamo/clampiamo il risultato prima di salvarlo.
+// DeepSeek produce una RACCOMANDAZIONE (mercato, selezione, probabilità,
+// affidabilità, motivazioni). NON produce quote: bookmakerOdds ed EV
+// vengono calcolati dal sistema a partire dalle quote REALI di API-Football,
+// e scartati se la quota reale non esiste.
 // ============================================================
 
+import { allowedMarketList } from "@/lib/sports/markets";
+import type { FixtureOdds, FixturePrediction } from "@/lib/sports/api-football";
+import type { StandingRow, TeamStatistics } from "@/lib/sports/openfootball";
 import type { AnalysisState } from "@/types";
-import type {
-  FixtureOdds,
-  HeadToHeadMatch,
-  InjuryInfo,
-  StandingRow,
-  TeamStatistics,
-} from "@/lib/sports/api-football";
-
-const DEEPSEEK_URL = "https://api.deepseek.com/chat/completions";
-const DEEPSEEK_MODEL = "deepseek-chat";
 
 export interface DeepSeekAnalysis {
   market: string;
   selection: string;
   estimatedProbability: number;
   fairOdds: number;
-  /** Quota bookmaker REALE. null se nessuna fonte la fornisce. */
-  bookmakerOdds: number | null;
-  /** EV = p × quota − 1. null quando bookmakerOdds manca: non calcolabile. */
-  ev: number | null;
   confidence: number;
   state: AnalysisState;
   reasons: string[];
   risks: string[];
 }
 
+/** Fonte del contesto statistico usata per questa partita. */
+export type StatsSource = "openfootball" | "api-football-prediction" | null;
+
 export interface MatchContext {
   homeTeam: string;
   awayTeam: string;
   competition: string;
   kickoffAt: string;
+  statsSource: StatsSource;
   homeStats: TeamStatistics | null;
   awayStats: TeamStatistics | null;
-  h2h: HeadToHeadMatch[] | null;
   standings: StandingRow[] | null;
-  homeInjuries: InjuryInfo[] | null;
-  awayInjuries: InjuryInfo[] | null;
+  /** Stima di terze parti: MAI presentata come fatto certo. */
+  prediction: FixturePrediction | null;
+  /** Quote reali, solo mercati ammessi. */
   odds: FixtureOdds | null;
 }
 
@@ -54,29 +48,37 @@ export function isDeepSeekConfigured(): boolean {
   return Boolean(process.env.DEEPSEEK_API_KEY);
 }
 
+const MARKET_LIST = allowedMarketList()
+  .map((m) => `  - mercato "${m.market}", selezione "${m.selection}"   (${m.label})`)
+  .join("\n");
+
 const SYSTEM_PROMPT = `Sei un analista professionista di scommesse sportive (calcio).
-Ti viene fornito il contesto di una partita e una serie di dati. Devi produrre UNA SOLA raccomandazione di mercato.
+Ti viene fornito il contesto di una partita e le QUOTE REALI disponibili.
+Devi produrre UNA SOLA raccomandazione, scegliendo ESCLUSIVAMENTE tra i mercati supportati.
 
-Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo introduttivo, senza markdown, con esattamente questa struttura:
+MERCATI SUPPORTATI (valori ammessi di "market" e "selection"):
+${MARKET_LIST}
 
+Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo introduttivo, senza markdown:
 {
-  "market": string,          // uno tra: "1X", "X2", "12", "Over/Under 1.5", "Over/Under 2.5", "Under 4.5", "Multigol", "Corner", "Cartellini"
-  "selection": string,       // es. "1", "X2", "Over 1.5", "Under 2.5", "1-3 gol"
+  "market": string,               // uno dei mercati supportati qui sopra
+  "selection": string,            // la selezione corrispondente
   "estimatedProbability": number, // probabilità stimata 0..1 (es. 0.55)
-  "fairOdds": number,        // quota equa = 1 / probabilità
-  "bookmakerOdds": number|null, // quota REALE se disponibile, altrimenti null (MAI stimata)
-  "ev": number|null,         // p × bookmakerOdds - 1; null se bookmakerOdds è null
-  "confidence": number,      // affidabilità 0..100
-  "state": string,           // "da_valutare" | "giocabile" | "scartata"
-  "reasons": string[],       // motivazioni brevi
-  "risks": string[]          // rischi e controindicazioni
+  "fairOdds": number,             // quota equa = 1 / estimatedProbability
+  "confidence": number,           // affidabilità 0..100
+  "state": string,                // "da_valutare" | "giocabile" | "scartata"
+  "reasons": string[],            // motivazioni brevi
+  "risks": string[]               // rischi e controindicazioni
 }
 
 Regole:
 - NON inventare dati mancanti: se un'informazione non è disponibile, non citarla oppure indica esplicitamente che manca.
+- NON inventare, stimare o approssimare QUOTE. Non inserire alcun campo "bookmakerOdds" o "ev": le quote reali e l'EV li calcola il sistema.
+- Scegli il mercato SOLO tra quelli supportati e SOLO se nella sezione QUOTE compare la quota reale corrispondente.
+- Se per il mercato scelto non esiste una quota reale, imposta state "da_valutare" e confidence <= 50.
+- Le percentuali e il contesto marcati come "stima di terze parti" NON sono fatti certi: trattali come indizi, non come dati verificati.
 - Se i dati sono insufficienti, usa state "da_valutare" e confidence bassa (<=50).
-- Se nella sezione QUOTE non sono disponibili quote reali, imposta "bookmakerOdds": null e "ev": null. NON stimare, NON approssimare e NON fornire una quota "ipotetica" in alcun campo. "fairOdds" resta calcolabile da "estimatedProbability". In questo caso "state" deve essere "da_valutare" e "confidence" <= 50.
-- "giocabile" solo se c'è un valore chiaro (EV positivo) e dati sufficienti.
+- "giocabile" solo se c'è un valore chiaro (EV positivo rispetto alla quota reale) e dati sufficienti.
 - "scartata" se il valore è negativo o il rischio è troppo alto.
 - "estimatedProbability" deve essere un numero compreso tra 0 e 1.
 - Rispondi SOLO con il JSON.`;
@@ -131,50 +133,30 @@ function extractJson(content: string): Record<string, unknown> | null {
 }
 
 /**
- * Quota valida (> 1) oppure null.
- * NON si fabbrica mai una quota: se non c'è una quota reale, resta assente.
+ * Valida e normalizza la risposta del modello.
+ *
+ * NON legge alcuna quota dalla risposta: `bookmakerOdds` ed `ev` non
+ * esistono più in questo tipo. La quota equa dipende solo dalla probabilità
+ * stimata. La verifica della quota REALE avviene nel chiamante.
  */
-function asOdds(value: unknown): number | null {
-  if (value == null || value === "") return null;
-  const n = Number(value);
-  return Number.isFinite(n) && n > 1 ? n : null;
-}
-
-/** Valida e normalizza l'oggetto JSON restituito da DeepSeek. */
 function parseAnalysis(json: Record<string, unknown>): DeepSeekAnalysis | null {
   const market = typeof json.market === "string" ? json.market.trim() : "";
   const selection = typeof json.selection === "string" ? json.selection.trim() : "";
   if (!market && !selection) return null;
 
   const probability = clamp(Number(json.estimatedProbability), 0, 1);
-  const fairOdds = probability > 0
-    ? Number((1 / probability).toFixed(2))
-    : Number(json.fairOdds) || 0;
-
-  // Senza una quota REALE non esiste EV: entrambi restano null.
-  const bookmakerOdds = asOdds(json.bookmakerOdds);
-  const ev =
-    bookmakerOdds != null && probability > 0
-      ? Number((probability * bookmakerOdds - 1).toFixed(4))
-      : null;
-
-  // Regola tassativa applicata nel CODICE, non solo nel prompt: quando la
-  // quota reale manca, la partita resta "da valutare" con confidence <= 50.
-  const rawConfidence = Math.round(clamp(Number(json.confidence), 0, 100));
-  const state: AnalysisState =
-    bookmakerOdds != null ? normalizeState(json.state) : "da_valutare";
-  const confidence =
-    bookmakerOdds != null ? rawConfidence : Math.min(rawConfidence, 50);
+  const fairOdds =
+    probability > 0
+      ? Number((1 / probability).toFixed(2))
+      : Number(json.fairOdds) || 0;
 
   return {
     market,
     selection,
     estimatedProbability: probability,
     fairOdds,
-    bookmakerOdds,
-    ev,
-    confidence,
-    state,
+    confidence: Math.round(clamp(Number(json.confidence), 0, 100)),
+    state: normalizeState(json.state),
     reasons: asStringArray(json.reasons),
     risks: asStringArray(json.risks),
   };
@@ -202,10 +184,6 @@ function fmtStats(label: string, s: TeamStatistics | null): string {
   return `${label}: ${parts.length ? parts.join(", ") : "dati non disponibili"}`;
 }
 
-/**
- * Percentuali sui risultati, su tutte le partite giocate.
- * Restituisce null quando la fonte non le fornisce: niente righe inventate.
- */
 function fmtPercentages(label: string, s: TeamStatistics | null): string | null {
   if (!s) return null;
   const parts: string[] = [];
@@ -216,10 +194,46 @@ function fmtPercentages(label: string, s: TeamStatistics | null): string | null 
   return parts.length > 0 ? `${label}: ${parts.join(", ")}` : null;
 }
 
-/** Ultime 5 partite giocate, già formattate dalla fonte. */
 function fmtLast5(label: string, s: TeamStatistics | null): string | null {
   if (!s?.last5 || s.last5.length === 0) return null;
   return `${label}: ${s.last5.join("; ")}`;
+}
+
+/**
+ * Sezione QUOTE: elenca, per ogni quota reale disponibile, la coppia
+ * market/selezione che il modello deve usare. Così la scelta del modello è
+ * verificabile contro il dato reale.
+ */
+function fmtOdds(odds: FixtureOdds | null): string[] {
+  if (!odds || odds.quotes.length === 0) {
+    return ["- nessuna quota reale disponibile: scegli comunque un mercato supportato ma imposta state \"da_valutare\"."];
+  }
+  const lines = [`- Bookmaker: ${odds.bookmaker}`];
+  for (const q of odds.quotes) {
+    lines.push(`- ${q.label} @ ${q.odd.toFixed(2)}`);
+  }
+  return lines;
+}
+
+/** Contesto di fallback: SEMPRE etichettato come stima di terze parti. */
+function fmtPrediction(p: FixturePrediction | null): string[] {
+  if (!p) return [];
+  const lines: string[] = [];
+  if (p.winner) lines.push(`- Esito previsto: ${p.winner}`);
+  if (p.winOrDraw) lines.push("- Previsione con possibile pareggio");
+  if (p.underOver) lines.push(`- Under/Over previsto: ${p.underOver}`);
+  if (p.advice) lines.push(`- Consiglio: ${p.advice}`);
+  if (p.percentHome || p.percentDraw || p.percentAway) {
+    lines.push(
+      `- Probabilità stimate: casa ${p.percentHome ?? "?"}, pareggio ${
+        p.percentDraw ?? "?"
+      }, ospiti ${p.percentAway ?? "?"}`
+    );
+  }
+  if (p.goalsHome || p.goalsAway) {
+    lines.push(`- Gol attesi: ${p.goalsHome ?? "?"} - ${p.goalsAway ?? "?"}`);
+  }
+  return lines;
 }
 
 export function buildContextText(ctx: MatchContext): string {
@@ -227,78 +241,70 @@ export function buildContextText(ctx: MatchContext): string {
     `PARTITA: ${ctx.homeTeam} vs ${ctx.awayTeam}`,
     `Campionato: ${ctx.competition}`,
     `Calcio d'inizio: ${ctx.kickoffAt}`,
-    "",
-    "FORMA SQUADRE",
-    fmtStats(`- ${ctx.homeTeam}`, ctx.homeStats),
-    fmtStats(`- ${ctx.awayTeam}`, ctx.awayStats),
+    `Fonte statistica: ${
+      ctx.statsSource === "openfootball"
+        ? "OpenFootball (risultati ufficiali della stagione)"
+        : ctx.statsSource === "api-football-prediction"
+          ? "nessun dataset stagionale: solo stima di terze parti (API-Football)"
+          : "nessuna"
+    }`,
   ];
 
-  // Sezioni opzionali: compaiono solo se la fonte fornisce davvero i dati.
-  const percentages = [
-    fmtPercentages(`- ${ctx.homeTeam}`, ctx.homeStats),
-    fmtPercentages(`- ${ctx.awayTeam}`, ctx.awayStats),
-  ].filter((line): line is string => line !== null);
-  if (percentages.length > 0) {
-    lines.push("", "PERCENTUALI SUI RISULTATI (stagione)", ...percentages);
-  }
-
-  const last5 = [
-    fmtLast5(`- ${ctx.homeTeam}`, ctx.homeStats),
-    fmtLast5(`- ${ctx.awayTeam}`, ctx.awayStats),
-  ].filter((line): line is string => line !== null);
-  if (last5.length > 0) {
-    lines.push("", "ULTIME 5 PARTITE", ...last5);
-  }
-
-  lines.push("", "PRECEDENTI (H2H)");
-
-  if (ctx.h2h && ctx.h2h.length > 0) {
-    for (const h of ctx.h2h) {
-      lines.push(`- ${h.homeTeam} ${h.homeGoals ?? "-"} - ${h.awayGoals ?? "-"} ${h.awayTeam} (${h.date.slice(0, 10)})`);
-    }
-  } else {
-    lines.push("- non disponibili");
-  }
-
-  lines.push("", "CLASSIFICA");
-  if (ctx.standings && ctx.standings.length > 0) {
-    const relevant = ctx.standings.filter(
-      (r) => r.team === ctx.homeTeam || r.team === ctx.awayTeam
+  if (ctx.homeStats || ctx.awayStats) {
+    lines.push(
+      "",
+      "FORMA SQUADRE",
+      fmtStats(`- ${ctx.homeTeam}`, ctx.homeStats),
+      fmtStats(`- ${ctx.awayTeam}`, ctx.awayStats)
     );
-    const shown = relevant.length > 0 ? relevant : ctx.standings.slice(0, 6);
-    for (const r of shown) {
-      const played = r.played != null ? `, ${r.played} g` : "";
-      const diff =
-        r.goalDifference != null
-          ? `, differenza reti ${r.goalDifference > 0 ? "+" : ""}${r.goalDifference}`
-          : "";
-      lines.push(`- #${r.rank} ${r.team} (${r.points} pt${played}${diff})`);
+
+    const percentages = [
+      fmtPercentages(`- ${ctx.homeTeam}`, ctx.homeStats),
+      fmtPercentages(`- ${ctx.awayTeam}`, ctx.awayStats),
+    ].filter((line): line is string => line !== null);
+    if (percentages.length > 0) {
+      lines.push("", "PERCENTUALI SUI RISULTATI (stagione)", ...percentages);
     }
-  } else {
-    lines.push("- non disponibile");
+
+    const last5 = [
+      fmtLast5(`- ${ctx.homeTeam}`, ctx.homeStats),
+      fmtLast5(`- ${ctx.awayTeam}`, ctx.awayStats),
+    ].filter((line): line is string => line !== null);
+    if (last5.length > 0) {
+      lines.push("", "ULTIME 5 PARTITE", ...last5);
+    }
+
+    lines.push("", "CLASSIFICA");
+    if (ctx.standings && ctx.standings.length > 0) {
+      const relevant = ctx.standings.filter(
+        (r) => r.team === ctx.homeTeam || r.team === ctx.awayTeam
+      );
+      const shown = relevant.length > 0 ? relevant : ctx.standings.slice(0, 6);
+      for (const r of shown) {
+        const played = r.played != null ? `, ${r.played} g` : "";
+        const diff =
+          r.goalDifference != null
+            ? `, differenza reti ${r.goalDifference > 0 ? "+" : ""}${r.goalDifference}`
+            : "";
+        lines.push(`- #${r.rank} ${r.team} (${r.points} pt${played}${diff})`);
+      }
+    } else {
+      lines.push("- non disponibile");
+    }
   }
 
-  lines.push("", "INFORTUNI / ASSENZE");
-  if (ctx.homeInjuries && ctx.homeInjuries.length > 0) {
-    lines.push(`- ${ctx.homeTeam}: ${ctx.homeInjuries.map((i) => `${i.player} (${i.reason || i.type})`).join("; ")}`);
-  } else {
-    lines.push(`- ${ctx.homeTeam}: nessuno segnalato o dato non disponibile`);
-  }
-  if (ctx.awayInjuries && ctx.awayInjuries.length > 0) {
-    lines.push(`- ${ctx.awayTeam}: ${ctx.awayInjuries.map((i) => `${i.player} (${i.reason || i.type})`).join("; ")}`);
-  } else {
-    lines.push(`- ${ctx.awayTeam}: nessuno segnalato o dato non disponibile`);
+  const prediction = fmtPrediction(ctx.prediction);
+  if (prediction.length > 0) {
+    lines.push(
+      "",
+      "CONTESTO API-FOOTBALL (STIMA DI TERZE PARTI — NON è un fatto certo)",
+      ...prediction
+    );
+  } else if (!ctx.homeStats && !ctx.awayStats) {
+    lines.push("", "CONTESTO", "- nessuna statistica disponibile per questa partita");
   }
 
-  lines.push("", "QUOTE");
-  if (ctx.odds) {
-    lines.push(`- Bookmaker: ${ctx.odds.bookmaker}`);
-    for (const m of ctx.odds.markets) {
-      lines.push(`- ${m.name}: ${m.values.map((v) => `${v.value}@${v.odd}`).join(", ")}`);
-    }
-  } else {
-    lines.push("- non disponibili (non inventarle)");
-  }
+  lines.push("", "QUOTE REALI DISPONIBILI", ...fmtOdds(ctx.odds));
 
   return lines.join("\n");
 }
@@ -314,14 +320,14 @@ export async function analyzeMatchWithDeepSeek(
 
   let response: Response;
   try {
-    response = await fetch(DEEPSEEK_URL, {
+    response = await fetch("https://api.deepseek.com/chat/completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: DEEPSEEK_MODEL,
+        model: "deepseek-chat",
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: userPrompt },
@@ -338,14 +344,16 @@ export async function analyzeMatchWithDeepSeek(
 
   if (!response.ok) return null;
 
-  let data: any;
+  let data: unknown;
   try {
     data = await response.json();
   } catch {
     return null;
   }
 
-  const content: unknown = data?.choices?.[0]?.message?.content;
+  const content = (
+    data as { choices?: { message?: { content?: unknown } }[] } | null
+  )?.choices?.[0]?.message?.content;
   if (typeof content !== "string") return null;
 
   const json = extractJson(content);

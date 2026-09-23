@@ -15,9 +15,8 @@
 
 import { revalidatePath } from "next/cache";
 
-import { isAdminEmail } from "@/lib/config";
+import { resolveAdminContext } from "@/lib/auth/admin-context";
 import { isoDateOffset } from "@/lib/dates";
-import { createClient } from "@/lib/supabase/server";
 import {
   fetchFixturesByDates,
   isSportsApiConfigured,
@@ -82,21 +81,12 @@ function migrationHint(code?: string): string | null {
 }
 
 export async function syncFixtures(): Promise<SyncOutcome> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) {
-    return outcome({ status: "error", message: "Non autenticato." });
+  // Contesto admin: sessione utente oppure job cron (service role).
+  const auth = await resolveAdminContext();
+  if (!auth.ok) {
+    return outcome({ status: "error", message: auth.message });
   }
-
-  if (!isAdminEmail(user.email)) {
-    return outcome({
-      status: "error",
-      message: "Solo un amministratore può aggiornare le partite.",
-    });
-  }
+  const { userId, supabase } = auth.ctx;
 
   if (!isSportsApiConfigured()) {
     return outcome({
@@ -106,7 +96,6 @@ export async function syncFixtures(): Promise<SyncOutcome> {
     });
   }
 
-  const userId = user.id;
   const dates: string[] = [];
   for (let i = 0; i < SYNC_DAYS; i++) dates.push(isoDateOffset(i));
 

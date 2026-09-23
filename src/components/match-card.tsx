@@ -56,7 +56,10 @@ export function MatchCard({
           <p className="text-sm text-zinc-400">{analysis.selection}</p>
         </div>
         <Metric label="Quota analisi" value={formatOdds(analysis.analysisOdds)} />
-        <Metric label="Quota Bet365" value={formatOdds(analysis.bet365Odds)} />
+        <Metric
+          label={analysis.bookmaker ? `Quota ${analysis.bookmaker}` : "Quota bookmaker"}
+          value={formatOdds(analysis.bet365Odds)}
+        />
         <Metric
           label="Prob. stimata"
           value={formatProbability(analysis.estimatedProbability)}

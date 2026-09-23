@@ -70,6 +70,10 @@ function mapAnalysis(row: any): Analysis {
     confidence: Number(row.confidence),
     risks: row.risks ?? "",
     state: row.state,
+    source: row.source ?? null,
+    // La colonna `bookmaker` arriva con la migration 004: se non è ancora
+    // applicata il campo è semplicemente assente.
+    bookmaker: row.bookmaker ?? null,
     updatedAt: row.updated_at,
   };
 }
@@ -218,13 +222,15 @@ function nullAnalysis(matchId: string): Analysis {
     market: "",
     selection: "",
     analysisOdds: 0,
-    bet365Odds: 0,
+    bet365Odds: null,
     estimatedProbability: 0,
     fairOdds: 0,
-    ev: 0,
+    ev: null,
     confidence: 0,
     risks: "",
     state: "da_valutare",
+    source: null,
+    bookmaker: null,
   };
 }
 

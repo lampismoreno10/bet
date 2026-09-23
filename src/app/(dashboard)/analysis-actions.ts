@@ -2,37 +2,60 @@
 
 // ============================================================
 // Operazioni operative (solo server, solo admin):
-//   - analyzeMatches   -> analisi dai soli dati locali (NESSUNA chiamata API-Football)
+//   - analyzeMatches   -> contesto + quote reali + DeepSeek + validazione
 //   - runFullPipeline  -> sync + analisi in sequenza
-//   - updateResults    -> aggiorna stato e risultato delle partite
+//   - updateResults    -> risultati + SETTLEMENT AUTOMATICO
+//
+// API-Football non è più usata per l'arricchimento pesante. Resta per:
+//   - sync delle partite e aggiornamento risultati
+//   - quote REALI (/odds, 1 richiesta per partita)
+//   - fallback leggero (/predictions, 1 richiesta per partita, SOLO per le
+//     competizioni senza dataset OpenFootball)
+// Tutte le chiamate passano dal throttle centralizzato.
 // ============================================================
 
 import { revalidatePath } from "next/cache";
 
 import { syncFixtures } from "@/app/(dashboard)/sync-actions";
-import { isAdminEmail } from "@/lib/config";
+import { resolveAdminContext } from "@/lib/auth/admin-context";
 import { getAnalysisCandidates } from "@/lib/data";
 import { todayIsoDate } from "@/lib/dates";
+import {
+  computeEv,
+  computeFairOdds,
+  getMarket,
+  parseModelSelection,
+  settleMarket,
+  type MarketCode,
+} from "@/lib/sports/markets";
 import { createClient } from "@/lib/supabase/server";
+import type { SupabaseClient } from "@supabase/supabase-js";
 import {
   analyzeMatchWithDeepSeek,
   isDeepSeekConfigured,
   type DeepSeekAnalysis,
   type MatchContext,
+  type StatsSource,
 } from "@/lib/ai/deepseek";
 import {
+  fetchFixtureOdds,
   fetchFixturesByIds,
+  fetchPrediction,
   isSportsApiConfigured,
-  type StandingRow,
-  type TeamStatistics,
+  type FixtureOdds,
+  type FixturePrediction,
 } from "@/lib/sports/api-football";
 import {
-  loadSerieA2026_27,
+  loadLeague,
+  OPENFOOTBALL_DATASETS,
   resolveOpenFootballTeam,
   type OpenFootballLeague,
   type OpenFootballMatchResult,
   type OpenFootballTeamStats,
+  type StandingRow,
+  type TeamStatistics,
 } from "@/lib/sports/openfootball";
+import { sportsThrottle } from "@/lib/sports/throttle";
 import type {
   AnalysisOutcome,
   Match,
@@ -50,42 +73,9 @@ function mapFixtureStatus(short: string): MatchState {
   return "scheduled";
 }
 
-async function requireAdmin(): Promise<{ ok: true; userId: string } | { ok: false; message: string }> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) return { ok: false, message: "Non autenticato." };
-  if (!isAdminEmail(user.email)) {
-    return { ok: false, message: "Solo un amministratore può eseguire questa operazione." };
-  }
-  return { ok: true, userId: user.id };
-}
-
 // ------------------------------------------------------------
-// ANALIZZA PARTITE
-//
-// ⚠️ Questa operazione NON effettua NESSUNA richiesta ad API-Football.
-// API-Football è riservata alla sola sincronizzazione delle partite
-// ("Aggiorna partite", sync-actions.ts) e a "Aggiorna risultati".
-//
-// L'arricchimento viene da una fonte alternativa: OpenFootball /
-// football.json (CC0, nessuna API key, nessuno scraping HTML).
-// Il dataset della lega è un file statico: viene scaricato UNA sola volta
-// per esecuzione, mai una volta per partita. Per ora è supportata solo la
-// Serie A italiana 2026/27.
-//
-// Se una squadra non viene riconosciuta, o se la fonte non è disponibile,
-// la partita resta "in attesa di analisi" e DeepSeek NON viene interrogato.
-// Nessun dato viene inventato.
+// Costruzione del contesto
 // ------------------------------------------------------------
-
-// La definizione di "competizione supportata" vive in `lib/analysis.ts`
-// (SUPPORTED_ANALYSIS_LEAGUES). È lì che il pre-filtro delle candidate la
-// applica, così il tetto MAX_ANALYSIS_PER_RUN non viene occupato dalle
-// partite di competizioni non ancora supportate: quelle restano in attesa
-// senza essere toccate.
 
 /** Contesto vuoto: nessun dato di arricchimento, nessuna invenzione. */
 function emptyContext(match: Match): MatchContext {
@@ -94,12 +84,11 @@ function emptyContext(match: Match): MatchContext {
     awayTeam: match.awayTeam,
     competition: match.competition,
     kickoffAt: match.kickoffAt,
+    statsSource: null,
     homeStats: null,
     awayStats: null,
-    h2h: null,
     standings: null,
-    homeInjuries: null,
-    awayInjuries: null,
+    prediction: null,
     odds: null,
   };
 }
@@ -112,7 +101,7 @@ function formatLast5Entry(entry: OpenFootballMatchResult): string {
   return `${RESULT_LABEL[entry.result]} ${entry.goalsFor}-${entry.goalsAgainst} vs ${entry.opponent} (${venue})`;
 }
 
-/** Adatta le statistiche OpenFootball al vocabolario condiviso del contesto. */
+/** Adatta le statistiche OpenFootball al vocabolario del contesto. */
 function toTeamStatistics(stats: OpenFootballTeamStats): TeamStatistics {
   return {
     form: stats.seasonForm || null,
@@ -138,12 +127,8 @@ function toTeamStatistics(stats: OpenFootballTeamStats): TeamStatistics {
 }
 
 /**
- * Classifica calcolata dai risultati giocati.
- *
- * Le due squadre in campo vengono rinominate con il nome come è salvato in
- * `matches` (es. "Inter" invece di "FC Internazionale Milano"): così la riga
- * di classifica corrisponde a `homeTeam`/`awayTeam` del resto del contesto e
- * il filtro sulla classifica nel prompt le riconosce.
+ * Classifica: le due squadre in campo vengono rinominate con il nome
+ * salvato in `matches`, così la riga corrisponde a homeTeam/awayTeam.
  */
 function toStandingRows(
   league: OpenFootballLeague,
@@ -166,191 +151,298 @@ function toStandingRows(
 }
 
 /**
- * Costruisce il contesto di una partita dai dati OpenFootball già in memoria.
- * Entrambe le squadre devono essere riconosciute: se anche una sola non lo è,
- * il contesto resta vuoto e la partita rimane in attesa.
+ * Contesto da OpenFootball. Restituisce null se una delle due squadre non è
+ * riconosciuta: in quel caso si passa al fallback.
  */
-function buildMatchContext(match: Match, league: OpenFootballLeague): MatchContext {
-  const ctx = emptyContext(match);
-
+function buildOpenFootballContext(
+  match: Match,
+  league: OpenFootballLeague
+): MatchContext | null {
   const homeKey = resolveOpenFootballTeam(match.homeTeam, league);
   const awayKey = resolveOpenFootballTeam(match.awayTeam, league);
-  if (!homeKey || !awayKey) return ctx;
+  if (!homeKey || !awayKey) return null;
 
   const home = league.teams.get(homeKey);
   const away = league.teams.get(awayKey);
-  if (!home || !away) return ctx;
+  if (!home || !away) return null;
 
   return {
-    ...ctx,
+    ...emptyContext(match),
+    statsSource: "openfootball",
     homeStats: toTeamStatistics(home),
     awayStats: toTeamStatistics(away),
     standings: toStandingRows(league, homeKey, awayKey, match),
   };
 }
 
-/**
- * True solo se il contesto contiene i dati necessari per interrogare DeepSeek:
- * servono ENTRAMBE le squadre. Con una sola squadra i dati sono insufficienti
- * e la partita resta in attesa.
- */
-function hasEnoughContext(ctx: MatchContext): boolean {
-  return Boolean(ctx.homeStats && ctx.awayStats);
+/** Contesto di fallback: solo la stima di terze parti, chiaramente etichettata. */
+function buildFallbackContext(
+  match: Match,
+  prediction: FixturePrediction | null
+): MatchContext {
+  return {
+    ...emptyContext(match),
+    statsSource: prediction ? "api-football-prediction" : null,
+    prediction,
+  };
 }
 
-export async function analyzeMatches(): Promise<AnalysisOutcome> {
-  const auth = await requireAdmin();
-  if (!auth.ok) {
-    return { ok: false, status: "error", message: auth.message, candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: [auth.message] };
+/**
+ * True se il contesto basta per interrogare DeepSeek: statistiche piene
+ * OpenFootball, oppure almeno la stima di fallback.
+ */
+function hasEnoughContext(ctx: MatchContext): boolean {
+  if (ctx.homeStats && ctx.awayStats) return true;
+  return ctx.prediction != null;
+}
+
+// ------------------------------------------------------------
+// Validazione della scelta del modello contro le quote REALI
+// ------------------------------------------------------------
+
+interface ResolvedAnalysis extends DeepSeekAnalysis {
+  bookmakerOdds: number | null;
+  ev: number | null;
+  bookmaker: string | null;
+  /** True se la quota reale è stata trovata e usata. */
+  hasRealOdds: boolean;
+}
+
+/**
+ * Verifica la scelta del modello contro le quote REALI:
+ *  - il mercato/selezione deve essere tra quelli supportati;
+ *  - deve esistere la quota reale corrispondente.
+ *
+ * La quota NON viene mai presa dalla risposta del modello. Senza quota reale:
+ * bookmakerOdds = null, ev = null, state "da_valutare" e confidence <= 50.
+ */
+function resolveAnalysisAgainstOdds(
+  analysis: DeepSeekAnalysis,
+  odds: FixtureOdds | null
+): ResolvedAnalysis {
+  const code: MarketCode | null = parseModelSelection(
+    analysis.market,
+    analysis.selection
+  );
+  const quote = code && odds ? odds.byMarket[code] : undefined;
+  const bookmakerOdds = quote ? quote.odd : null;
+  const ev =
+    bookmakerOdds != null
+      ? computeEv(analysis.estimatedProbability, bookmakerOdds)
+      : null;
+
+  let state = analysis.state;
+  let confidence = analysis.confidence;
+  if (bookmakerOdds == null) {
+    state = "da_valutare";
+    confidence = Math.min(confidence, 50);
+  } else if (state === "giocabile" && (ev == null || ev <= 0)) {
+    // "giocabile" richiede un valore dimostrabile sulla quota reale.
+    state = "da_valutare";
   }
 
-  // Solo partite di competizioni supportate: le altre restano in attesa.
+  const spec = code ? getMarket(code) : undefined;
+
+  return {
+    ...analysis,
+    market: spec?.modelMarket ?? analysis.market,
+    selection: spec?.modelSelection ?? analysis.selection,
+    fairOdds: computeFairOdds(analysis.estimatedProbability),
+    state,
+    confidence,
+    bookmakerOdds,
+    ev,
+    bookmaker: quote ? (odds?.bookmaker ?? null) : null,
+    hasRealOdds: bookmakerOdds != null,
+  };
+}
+
+/** Inserisce/aggiorna l'analisi. Tollerante se la migration 004 non è ancora stata applicata. */
+async function insertAnalysis(
+  supabase: SupabaseClient,
+  userId: string,
+  matchId: string,
+  a: ResolvedAnalysis,
+  statsSource: StatsSource
+): Promise<string | null> {
+  const payload: Record<string, unknown> = {
+    user_id: userId,
+    match_id: matchId,
+    market: a.market,
+    selection: a.selection,
+    analysis_odds: a.fairOdds || null,
+    bet365_odds: a.bookmakerOdds,
+    estimated_probability: a.estimatedProbability,
+    fair_odds: a.fairOdds || null,
+    ev: a.ev,
+    confidence: a.confidence,
+    risks: a.risks.length ? a.risks.join(" | ") : a.reasons.join(" | ") || null,
+    state: a.state,
+    source: statsSource ?? "deepseek",
+    reasons: a.reasons.length ? a.reasons : null,
+  };
+
+  let { error } = await supabase
+    .from("analyses")
+    .upsert({ ...payload, bookmaker: a.bookmaker }, { onConflict: "user_id,match_id" });
+
+  // La colonna `bookmaker` arriva con la migration 004: se non è ancora
+  // applicata si salva il resto senza bloccare la pipeline.
+  if (error && (error.code === "42703" || error.code === "PGRST204")) {
+    ({ error } = await supabase
+      .from("analyses")
+      .upsert(payload, { onConflict: "user_id,match_id" }));
+  }
+
+  return error ? error.message : null;
+}
+
+// ------------------------------------------------------------
+// ANALIZZA PARTITE
+// ------------------------------------------------------------
+
+export async function analyzeMatches(): Promise<AnalysisOutcome> {
+  const auth = await resolveAdminContext();
+  if (!auth.ok) {
+    return { ok: false, status: "error", message: auth.message, candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, openFootball: 0, apiFallback: 0, oddsFound: 0, errors: [auth.message] };
+  }
+  const { userId, supabase } = auth.ctx;
+  if (!isSportsApiConfigured()) {
+    return { ok: false, status: "error", message: "SPORTS_API_KEY non configurata: le quote reali non sono recuperabili.", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, openFootball: 0, apiFallback: 0, oddsFound: 0, errors: ["SPORTS_API_KEY non configurata"] };
+  }
+  if (!isDeepSeekConfigured()) {
+    return { ok: false, status: "error", message: "DEEPSEEK_API_KEY non configurata sul server.", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, openFootball: 0, apiFallback: 0, oddsFound: 0, errors: ["DEEPSEEK_API_KEY non configurata"] };
+  }
+
   const candidates = await getAnalysisCandidates();
   if (candidates.length === 0) {
-    return { ok: true, status: "ok", message: "Nessuna partita da analizzare: nessuna candidata delle competizioni supportate (Serie A 2026/27).", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: [] };
+    return { ok: true, status: "ok", message: "Nessuna partita da analizzare: nessuna candidata in whitelist senza analisi.", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, openFootball: 0, apiFallback: 0, oddsFound: 0, errors: [] };
   }
 
-  const supabase = await createClient();
-  const userId = auth.userId;
-
-  async function insertAnalysis(matchId: string, a: DeepSeekAnalysis) {
-    const { error } = await supabase.from("analyses").upsert(
-      {
-        user_id: userId,
-        match_id: matchId,
-        market: a.market,
-        selection: a.selection,
-        analysis_odds: a.fairOdds || null,
-        bet365_odds: a.bookmakerOdds || null,
-        estimated_probability: a.estimatedProbability,
-        fair_odds: a.fairOdds || null,
-        ev: a.ev,
-        confidence: a.confidence,
-        risks: a.risks.length ? a.risks.join(" | ") : a.reasons.join(" | ") || null,
-        state: a.state,
-        source: "deepseek",
-        reasons: a.reasons.length ? a.reasons : null,
-      },
-      { onConflict: "user_id,match_id" }
-    );
-    return error;
-  }
-
-  // Fonte alternativa: UNA sola richiesta HTTP per esecuzione. Le candidate
-  // sono già filtrate per competizione supportata da `getAnalysisCandidates`.
-  let league: OpenFootballLeague | null = null;
-  let sourceError: string | null = null;
-  if (candidates.length > 0) {
-    try {
-      league = await loadSerieA2026_27();
-    } catch (err) {
-      sourceError =
-        err instanceof Error ? err.message : "fonte OpenFootball non raggiungibile";
-    }
-  }
-
-  // Nessuna chiamata API-Football: il contesto viene costruito solo dai dati
-  // OpenFootball già in memoria. Se una squadra non è riconosciuta,
-  // `buildMatchContext` restituisce un contesto vuoto (partita in attesa).
-  const prepared = candidates.map((match) => ({
-    match,
-    ctx: league ? buildMatchContext(match, league) : emptyContext(match),
-  }));
-  const ready = prepared.filter((p) => hasEnoughContext(p.ctx));
-  const pending = prepared.length - ready.length;
-
-  // Diagnostica: squadre delle candidate che non sono state riconosciute
-  // (le loro partite restano in attesa).
-  const unresolvedTeams = league
-    ? [
-        ...new Set(
-          candidates
-            .flatMap((m) => [m.homeTeam, m.awayTeam])
-            .filter((name) => !resolveOpenFootballTeam(name, league))
-        ),
-      ]
-    : [];
-
-  // Nessuna candidata ha i dati necessari: non si chiama DeepSeek e non si
-  // scrive nulla in `analyses`. Le partite restano in attesa di analisi.
-  if (ready.length === 0) {
-    const reason = sourceError
-      ? `fonte OpenFootball non raggiungibile (${sourceError})`
-      : unresolvedTeams.length > 0
-        ? `squadre non riconosciute: ${unresolvedTeams.join(", ")}`
-        : "nessun dato di contesto disponibile per le competizioni supportate";
-
-    try {
-      await supabase.from("analysis_runs").insert({
-        user_id: userId,
-        sync_date: todayIsoDate(),
-        candidates_found: candidates.length,
-        analyzed: 0,
-        analyses_created: 0,
-        requests_used: 0,
-        deepseek_calls: 0,
-        status: sourceError ? "partial" : "ok",
-        error_message: sourceError,
-      });
-    } catch {
-      // ignora: il log è accessorio
-    }
-
-    return {
-      ok: true,
-      status: sourceError ? "partial" : "ok",
-      message: `${pending} partite restano in attesa di analisi: ${reason}.`,
-      candidatesFound: candidates.length,
-      analyzed: 0,
-      analysesCreated: 0,
-      requestsUsed: 0,
-      deepseekCalls: 0,
-      errors: sourceError ? [sourceError] : [],
-    };
-  }
-
-  // Da qui in poi il percorso DeepSeek è invariato: si attiva solo per le
-  // partite il cui contesto è stato popolato dalla fonte.
-  if (!isDeepSeekConfigured()) {
-    return { ok: false, status: "error", message: "DEEPSEEK_API_KEY non configurata sul server.", candidatesFound: candidates.length, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: ["DEEPSEEK_API_KEY non configurata"] };
-  }
-
+  const errors: string[] = [];
+  let requestsUsed = 0;
+  let deepseekCalls = 0;
   let analyzed = 0;
   let analysesCreated = 0;
-  let deepseekCalls = 0;
-  const errors: string[] = [];
+  let openFootball = 0;
+  let apiFallback = 0;
+  let oddsFound = 0;
+  let stoppedForQuota = false;
 
-  for (const { match, ctx } of ready) {
-    const label = `${match.homeTeam} vs ${match.awayTeam}`;
+  // 1) Dataset OpenFootball: UNA fetch per lega distinta (con cache).
+  const datasets = new Map<number, OpenFootballLeague>();
+  const leagueIds = [
+    ...new Set(
+      candidates
+        .map((m) => m.leagueId)
+        .filter((id): id is number => id != null && id in OPENFOOTBALL_DATASETS)
+    ),
+  ];
+  for (const leagueId of leagueIds) {
     try {
-      const analysis = await analyzeMatchWithDeepSeek(ctx);
-      deepseekCalls += 1;
+      datasets.set(leagueId, await loadLeague(leagueId));
+    } catch (err) {
+      errors.push(
+        `dataset OpenFootball lega ${leagueId}: ${
+          err instanceof Error ? err.message : "non disponibile"
+        }`
+      );
+    }
+  }
 
-      if (!analysis) {
-        errors.push(`${label}: DeepSeek non ha restituito un'analisi valida`);
+  // 2) Una passata per partita: contesto -> quote -> DeepSeek -> validazione.
+  for (const match of candidates) {
+    const label = `${match.homeTeam} vs ${match.awayTeam}`;
+
+    if (!sportsThrottle.canSpend(2)) {
+      stoppedForQuota = true;
+      errors.push(
+        "quota API-Football insufficiente: analisi interrotta prima di intaccare la riserva."
+      );
+      break;
+    }
+
+    try {
+      const extId = Number(match.externalId);
+      if (!Number.isFinite(extId)) {
+        errors.push(`${label}: external_id non valido`);
         continue;
       }
 
-      const insertError = await insertAnalysis(match.id, analysis);
+      // 2a) Contesto: OpenFootball, altrimenti fallback leggero.
+      const league =
+        match.leagueId != null ? datasets.get(match.leagueId) : undefined;
+      let ctx = league ? buildOpenFootballContext(match, league) : null;
+      if (ctx) {
+        openFootball += 1;
+      } else {
+        const prediction = await fetchPrediction(extId);
+        requestsUsed += 1;
+        if (prediction) apiFallback += 1;
+        ctx = buildFallbackContext(match, prediction);
+      }
+
+      // 2b) Quote REALI: 1 richiesta per partita.
+      let odds: FixtureOdds | null = null;
+      try {
+        odds = await fetchFixtureOdds(extId);
+      } catch (err) {
+        errors.push(
+          `${label}: quote non recuperate (${
+            err instanceof Error ? err.message : "errore"
+          })`
+        );
+      }
+      requestsUsed += 1;
+      ctx.odds = odds;
+      if (odds) oddsFound += 1;
+
+      if (!hasEnoughContext(ctx)) {
+        errors.push(`${label}: nessun contesto disponibile (partita lasciata in attesa)`);
+        if (sportsThrottle.isRateLimited()) break;
+        continue;
+      }
+
+      // 2c) DeepSeek.
+      const analysis = await analyzeMatchWithDeepSeek(ctx);
+      deepseekCalls += 1;
+      if (!analysis) {
+        errors.push(`${label}: DeepSeek non ha restituito un'analisi valida`);
+        if (sportsThrottle.isRateLimited()) break;
+        continue;
+      }
+      analyzed += 1;
+
+      // 2d) Validazione contro le quote reali + salvataggio.
+      const resolved = resolveAnalysisAgainstOdds(analysis, odds);
+      const insertError = await insertAnalysis(
+        supabase,
+        userId,
+        match.id,
+        resolved,
+        ctx.statsSource
+      );
       if (insertError) {
-        errors.push(`${label}: salvataggio fallito (${insertError.message})`);
+        errors.push(`${label}: salvataggio fallito (${insertError})`);
       } else {
         analysesCreated += 1;
       }
-      analyzed += 1;
+
+      if (sportsThrottle.isRateLimited()) break;
     } catch (err) {
       errors.push(`${label}: ${err instanceof Error ? err.message : "errore imprevisto"}`);
     }
   }
 
-  // Diagnostica: squadre non riconosciute fra le candidate supportate.
-  if (unresolvedTeams.length > 0) {
-    errors.push(
-      `squadre non riconosciute (partite lasciate in attesa): ${unresolvedTeams.join(", ")}`
-    );
-  }
+  const status =
+    sportsThrottle.isRateLimited() || stoppedForQuota
+      ? "partial"
+      : errors.length > 0 && analysesCreated > 0
+        ? "partial"
+        : errors.length > 0
+          ? "error"
+          : "ok";
 
-  // Log dell'operazione (accessorio, non deve bloccare).
   try {
     await supabase.from("analysis_runs").insert({
       user_id: userId,
@@ -358,30 +450,32 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
       candidates_found: candidates.length,
       analyzed,
       analyses_created: analysesCreated,
-      requests_used: 0,
+      requests_used: requestsUsed,
       deepseek_calls: deepseekCalls,
-      status: errors.length > 0 && analysesCreated > 0 ? "partial" : errors.length > 0 ? "error" : "ok",
+      status,
       error_message: errors.length > 0 ? errors.join(" | ").slice(0, 1000) : null,
     });
   } catch {
-    // ignora
+    // ignora: il log è accessorio
   }
 
   revalidatePath("/", "layout");
 
-  const status = errors.length > 0 && analysesCreated > 0 ? "partial" : errors.length > 0 ? "error" : "ok";
   return {
     ok: status !== "error",
     status,
     message:
       analysesCreated > 0
-        ? `${analysesCreated} analisi create su ${ready.length} candidate con dati.`
-        : `Nessuna analisi creata (${ready.length} candidate con dati, ${errors.length} problemi).`,
+        ? `${analysesCreated} analisi su ${candidates.length} candidate · OpenFootball: ${openFootball} · fallback API: ${apiFallback} · quote reali: ${oddsFound}.`
+        : `Nessuna analisi creata (${candidates.length} candidate, ${errors.length} problemi).`,
     candidatesFound: candidates.length,
     analyzed,
     analysesCreated,
-    requestsUsed: 0,
+    requestsUsed,
     deepseekCalls,
+    openFootball,
+    apiFallback,
+    oddsFound,
     errors: errors.slice(0, 10),
   };
 }
@@ -393,8 +487,6 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
 export async function runFullPipeline(): Promise<AnalysisOutcome> {
   const sync = await syncFixtures();
 
-  // Non proseguire con l'analisi se l'import è fallito (evita di bruciare
-  // quota API e chiamate DeepSeek a vuoto).
   if (sync.status !== "ok") {
     return {
       ok: false,
@@ -405,6 +497,9 @@ export async function runFullPipeline(): Promise<AnalysisOutcome> {
       analysesCreated: 0,
       requestsUsed: sync.requestsUsed,
       deepseekCalls: 0,
+      openFootball: 0,
+      apiFallback: 0,
+      oddsFound: 0,
       errors: [sync.message],
     };
   }
@@ -419,20 +514,123 @@ export async function runFullPipeline(): Promise<AnalysisOutcome> {
 }
 
 // ------------------------------------------------------------
-// AGGIORNA RISULTATI
+// SETTLEMENT AUTOMATICO
+// ------------------------------------------------------------
+
+export interface SettlementReport {
+  settled: number;
+  leftOpen: number;
+  errors: string[];
+}
+
+/**
+ * Chiude automaticamente le giocate aperte delle partite concluse usando
+ * SOLO il risultato finale. Se il mercato non è riconosciuto la giocata
+ * resta APERTA e il problema viene segnalato: non si indovina mai.
+ * Non è possibile liquidare due volte (si parte solo da status 'open').
+ */
+async function settleOpenBets(
+  supabase: SupabaseClient,
+  userId: string
+): Promise<SettlementReport> {
+  const report: SettlementReport = { settled: 0, leftOpen: 0, errors: [] };
+
+  const { data: openBets } = await supabase
+    .from("bets")
+    .select("id, match_id, analysis_id, market, selection, odds, stake, status")
+    .eq("user_id", userId)
+    .eq("status", "open")
+    .limit(200);
+
+  const bets = openBets ?? [];
+  if (bets.length === 0) return report;
+
+  const matchIds = [...new Set(bets.map((b) => b.match_id))];
+  const { data: matchRows } = await supabase
+    .from("matches")
+    .select("id, status, home_score, away_score")
+    .in("id", matchIds);
+
+  const matchesById = new Map((matchRows ?? []).map((m) => [m.id, m]));
+  const closedAnalysisIds = new Set<string>();
+
+  for (const bet of bets) {
+    const match = matchesById.get(bet.match_id);
+    if (!match || match.status !== "finished") continue;
+    if (match.home_score == null || match.away_score == null) continue;
+
+    const code = parseModelSelection(bet.market, bet.selection);
+    const outcome = code
+      ? settleMarket(code, Number(match.home_score), Number(match.away_score))
+      : null;
+
+    if (!code || !outcome) {
+      report.leftOpen += 1;
+      report.errors.push(
+        `giocata ${bet.id}: mercato non liquidabile ("${bet.market}" / "${bet.selection}") — lasciata aperta`
+      );
+      continue;
+    }
+
+    const stake = Number(bet.stake) || 0;
+    const odds = Number(bet.odds) || 0;
+    const profit =
+      outcome === "won"
+        ? Number((stake * (odds - 1)).toFixed(2))
+        : Number((-stake).toFixed(2));
+
+    const { error } = await supabase
+      .from("bets")
+      .update({
+        status: outcome === "won" ? "won" : "lost",
+        profit,
+        settled_at: new Date().toISOString(),
+      })
+      .eq("id", bet.id)
+      .eq("user_id", userId)
+      .eq("status", "open"); // guardia: nessun settlement doppio
+
+    if (error) {
+      report.errors.push(`giocata ${bet.id}: ${error.message}`);
+      continue;
+    }
+    report.settled += 1;
+    if (bet.analysis_id) closedAnalysisIds.add(bet.analysis_id);
+  }
+
+  // Le analisi delle giocate chiuse passano a "chiusa".
+  for (const analysisId of closedAnalysisIds) {
+    const { error } = await supabase
+      .from("analyses")
+      .update({ state: "chiusa" })
+      .eq("id", analysisId)
+      .eq("user_id", userId);
+    if (error) report.errors.push(`analisi ${analysisId}: ${error.message}`);
+  }
+
+  return report;
+}
+
+/** Liquidazione delle giocate già maturabili (usata dal job giornaliero). */
+export async function settleFinishedBets(): Promise<SettlementReport> {
+  const auth = await resolveAdminContext();
+  if (!auth.ok) return { settled: 0, leftOpen: 0, errors: [auth.message] };
+  return settleOpenBets(auth.ctx.supabase, auth.ctx.userId);
+}
+
+// ------------------------------------------------------------
+// AGGIORNA RISULTATI (+ settlement)
 // ------------------------------------------------------------
 
 export async function updateResults(): Promise<ResultsOutcome> {
-  const auth = await requireAdmin();
+  const auth = await resolveAdminContext();
   if (!auth.ok) {
-    return { ok: false, message: auth.message, requestsUsed: 0, updated: 0, finished: 0, errors: [auth.message] };
+    return { ok: false, message: auth.message, requestsUsed: 0, updated: 0, finished: 0, settled: 0, leftOpen: 0, errors: [auth.message] };
   }
+  const { userId, supabase } = auth.ctx;
   if (!isSportsApiConfigured()) {
-    return { ok: false, message: "SPORTS_API_KEY non configurata.", requestsUsed: 0, updated: 0, finished: 0, errors: ["SPORTS_API_KEY non configurata"] };
+    return { ok: false, message: "SPORTS_API_KEY non configurata.", requestsUsed: 0, updated: 0, finished: 0, settled: 0, leftOpen: 0, errors: ["SPORTS_API_KEY non configurata"] };
   }
-
-  const supabase = await createClient();
-  const userId = auth.userId;
 
   const { data: matches } = await supabase
     .from("matches")
@@ -442,21 +640,22 @@ export async function updateResults(): Promise<ResultsOutcome> {
     .neq("status", "finished");
 
   const rows = matches ?? [];
-  if (rows.length === 0) {
-    return { ok: true, message: "Nessuna partita da aggiornare.", requestsUsed: 0, updated: 0, finished: 0, errors: [] };
-  }
+  const errors: string[] = [];
+  let requestsUsed = 0;
+  let updated = 0;
+  let finished = 0;
 
   const ids = rows
     .map((r) => Number(r.external_id))
     .filter((n) => Number.isFinite(n));
 
   const CHUNK = 20;
-  let requestsUsed = 0;
-  let updated = 0;
-  let finished = 0;
-  const errors: string[] = [];
-
   for (let i = 0; i < ids.length; i += CHUNK) {
+    if (!sportsThrottle.canSpend(1)) {
+      errors.push("quota API-Football insufficiente: aggiornamento risultati interrotto.");
+      break;
+    }
+
     const chunk = ids.slice(i, i + CHUNK);
     const chunkSet = new Set(chunk.map(String));
     const chunkRows = rows.filter((r) => chunkSet.has(String(r.external_id)));
@@ -477,11 +676,7 @@ export async function updateResults(): Promise<ResultsOutcome> {
 
         const { error } = await supabase
           .from("matches")
-          .update({
-            status,
-            home_score: homeScore,
-            away_score: awayScore,
-          })
+          .update({ status, home_score: homeScore, away_score: awayScore })
           .eq("id", row.id)
           .eq("user_id", userId);
 
@@ -493,18 +688,31 @@ export async function updateResults(): Promise<ResultsOutcome> {
         }
       }
     } catch (err) {
-      errors.push(err instanceof Error ? err.message : "errore durante il recupero risultati");
+      errors.push(
+        err instanceof Error ? err.message : "errore durante il recupero risultati"
+      );
     }
   }
 
+  // Settlement: passata separata su TUTTE le giocate aperte con partita
+  // conclusa. Così anche un esito non liquidato in una run precedente viene
+  // recuperato (la partita, ormai 'finished', non rientrerebbe più sopra).
+  const settlement = await settleOpenBets(supabase, userId);
+  errors.push(...settlement.errors);
+
   revalidatePath("/", "layout");
+
+  const settledNote = settlement.settled > 0 ? `, ${settlement.settled} giocate chiuse` : "";
+  const openNote = settlement.leftOpen > 0 ? `, ${settlement.leftOpen} non liquidabili` : "";
 
   return {
     ok: errors.length === 0,
-    message: `${updated} partite aggiornate${finished > 0 ? ` (${finished} terminate)` : ""}.`,
+    message: `${updated} partite aggiornate${finished > 0 ? ` (${finished} terminate)` : ""}${settledNote}${openNote}.`,
     requestsUsed,
     updated,
     finished,
+    settled: settlement.settled,
+    leftOpen: settlement.leftOpen,
     errors: errors.slice(0, 10),
   };
 }

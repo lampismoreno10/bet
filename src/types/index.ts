@@ -48,6 +48,10 @@ export interface Analysis {
   confidence: number; // affidabilità 0..100
   risks: string; // rischi / motivazioni
   state: AnalysisState;
+  /** Fonte statistica usata: "openfootball" | "api-football-prediction". */
+  source: string | null;
+  /** Bookmaker della quota reale (null se la quota non esiste). */
+  bookmaker: string | null;
   updatedAt?: string;
   isDemo?: boolean;
 }
@@ -194,8 +198,14 @@ export interface AnalysisOutcome {
   candidatesFound: number;
   analyzed: number;
   analysesCreated: number;
-  requestsUsed: number; // richieste API-Football consumate
+  requestsUsed: number; // richieste API-Football EFFETTUATE in questa run
   deepseekCalls: number; // chiamate a DeepSeek
+  /** Candidate analizzate con statistiche OpenFootball. */
+  openFootball: number;
+  /** Candidate analizzate con il fallback /predictions di API-Football. */
+  apiFallback: number;
+  /** Candidate per cui sono state trovate quote reali. */
+  oddsFound: number;
   errors: string[];
 }
 
@@ -206,6 +216,10 @@ export interface ResultsOutcome {
   requestsUsed: number;
   updated: number;
   finished: number;
+  /** Giocate chiuse automaticamente dal risultato finale. */
+  settled: number;
+  /** Giocate aperte con mercato non liquidabile (lasciate aperte). */
+  leftOpen: number;
   errors: string[];
 }
 

@@ -2,44 +2,43 @@
 // Pre-filtro locale delle partite candidate all'analisi.
 //
 // Serve a LIMITARE il consumo delle API: selezioniamo in locale solo
-// un numero contenuto di partite (imminenti e senza analisi), così il
-// passo "recupero dati approfonditi + DeepSeek" non gira su tutte le
-// partite del mondo ma su un sottoinsieme piccolo e rilevante.
+// un numero contenuto di partite (imminenti, della whitelist e senza
+// analisi), così il passo "contesto + quote + DeepSeek" non gira su tutte
+// le partite del mondo ma su un sottoinsieme piccolo e rilevante.
 // ============================================================
 
+import { TRACKED_LEAGUES } from "@/lib/sports/leagues";
 import type { Match } from "@/types";
 
 export const DEFAULT_MAX_CANDIDATES = 8;
 
-// ------------------------------------------------------------
-// Competizioni attualmente supportate dall'arricchimento (OpenFootball).
-//
-// Le partite delle altre competizioni NON vengono toccate: restano
-// semplicemente in attesa finché non avranno una fonte dati compatibile.
-// Aggiungere una competizione qui la rende eleggibile all'analisi.
-// ------------------------------------------------------------
-export const SUPPORTED_ANALYSIS_LEAGUES: ReadonlyArray<{
-  leagueId: number;
-  season: number;
-}> = [
-  { leagueId: 135, season: 2026 }, // Serie A 2026/27
-];
+/** Stagione supportata dalla pipeline (i dataset OpenFootball coprono 2026/27). */
+export const SUPPORTED_ANALYSIS_SEASON = 2026;
 
-/** Id delle competizioni supportate (per il filtro in query). */
+// ------------------------------------------------------------
+// Competizioni eleggibili: TUTTA la whitelist.
+//
+// Per ognuna la pipeline sceglie da sola la fonte di contesto:
+//   - OpenFootball, se esiste un dataset configurato per quella lega;
+//   - altrimenti il fallback leggero di API-Football (/predictions).
+//
+// Il tetto MAX_ANALYSIS_PER_RUN è applicato DOPO questo filtro, così le
+// partite fuori whitelist non occupano i posti disponibili.
+// ------------------------------------------------------------
+
+/** Id delle competizioni eleggibili (per il filtro in query). */
 export function supportedLeagueIds(): number[] {
-  return SUPPORTED_ANALYSIS_LEAGUES.map((l) => l.leagueId);
+  return TRACKED_LEAGUES.map((l) => l.id);
 }
 
 /**
- * True se la partita appartiene a una competizione supportata dall'analisi.
- * `season` null è accettato: gli import senza stagione restano eleggibili.
+ * True se la partita è eleggibile all'analisi: competizione in whitelist e
+ * stagione allineata. `season` null è accettato (import senza stagione).
  */
 export function isSupportedForAnalysis(match: Match): boolean {
-  const supported = SUPPORTED_ANALYSIS_LEAGUES.find(
-    (l) => l.leagueId === match.leagueId
-  );
-  if (!supported) return false;
-  return match.season == null || match.season === supported.season;
+  if (match.leagueId == null) return false;
+  if (!TRACKED_LEAGUES.some((l) => l.id === match.leagueId)) return false;
+  return match.season == null || match.season === SUPPORTED_ANALYSIS_SEASON;
 }
 
 /** Numero massimo di candidate per singola esecuzione (configurabile via env). */

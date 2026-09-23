@@ -150,8 +150,15 @@ export default async function MatchDetailPage({
             <Row label="Quota di analisi">
               {formatOdds(analysis.analysisOdds)}
             </Row>
-            <Row label="Quota bookmaker (Bet365)">
+            <Row label={analysis.bookmaker ? `Quota bookmaker (${analysis.bookmaker})` : "Quota bookmaker"}>
               {formatOdds(analysis.bet365Odds)}
+            </Row>
+            <Row label="Fonte statistica">
+              {analysis.source === "openfootball"
+                ? "OpenFootball (stagione)"
+                : analysis.source === "api-football-prediction"
+                  ? "API-Football (stima di terze parti)"
+                  : "—"}
             </Row>
             <Row label="Quota equa">{formatOdds(analysis.fairOdds)}</Row>
             <Row label="Differenza bookmaker − equa">

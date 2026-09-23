@@ -2,11 +2,26 @@
 // Client API-Football (api-sports.io) — SOLO SERVER-SIDE.
 //
 // ⚠️ Questo modulo NON deve essere importato da Client Component:
-// usa la chiave `SPORTS_API_KEY` (senza prefisso NEXT_PUBLIC_), che
-// deve restare esclusivamente sul server.
+// usa la chiave `SPORTS_API_KEY` (senza prefisso NEXT_PUBLIC_).
+//
+// Uso previsto, e nient'altro:
+//   1. sync delle partite      GET /fixtures?date=
+//   2. aggiornamento risultati GET /fixtures?ids=
+//   3. quote reali             GET /odds?fixture=        (1 per partita)
+//   4. contesto di fallback    GET /predictions?fixture=  (1 per partita,
+//      SOLO per le competizioni non coperte da OpenFootball)
+//
+// Ogni chiamata passa dal throttle centralizzato (piano Free: 10/min):
+// sequenziale, con intervallo minimo e rispetto della riserva giornaliera.
+//
+// Le vecchie chiamate di arricchimento (teams/statistics, injuries,
+// head-to-head, standings) sono state RIMOSSE: lo schema da 49 richieste
+// per 8 partite non esiste più.
 // ============================================================
 
 import { isTrackedLeague } from "@/lib/sports/leagues";
+import { extractQuotesFromBets, type MarketCode } from "@/lib/sports/markets";
+import { sportsThrottle } from "@/lib/sports/throttle";
 
 export const API_BASE_URL = "https://v3.football.api-sports.io";
 
@@ -17,6 +32,11 @@ export type SportsApiErrorKind =
   | "http"
   | "network"
   | "unknown";
+
+export interface ApiQuotaMeta {
+  requestsLimit: number | null;
+  requestsRemaining: number | null;
+}
 
 export class SportsApiError extends Error {
   kind: SportsApiErrorKind;
@@ -51,11 +71,6 @@ export interface ApiFootballFixture {
   goals?: { home: number | null; away: number | null };
 }
 
-export interface ApiQuotaMeta {
-  requestsLimit: number | null;
-  requestsRemaining: number | null;
-}
-
 export interface FixturesResult {
   fixtures: ApiFootballFixture[];
   /** Tutte le partite restituite dall'API, prima del filtro sui campionati. */
@@ -75,6 +90,10 @@ function toNumberOrNull(value: unknown): number | null {
   if (value == null) return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
+}
+
+function asTrimmedString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
 /** Estrae i messaggi d'errore dal campo `errors` (array o oggetto). */
@@ -112,9 +131,6 @@ function classifyApiErrors(errors: unknown): SportsApiError | null {
     );
   }
 
-  // La quota esaurita si riconosce dal testo (rate limit), non dalla sola
-  // chiave "requests": la stessa chiave è usata anche per altri errori
-  // (es. data fuori range sul piano Free).
   if (/rate limit|too many requests|requests\/day|quota|limit reached/.test(lower)) {
     return new SportsApiError(`Quota API esaurita: ${text}`, "quota_exceeded");
   }
@@ -131,7 +147,10 @@ interface ApiResponse {
   quota: ApiQuotaMeta;
 }
 
-/** Esegue una GET verso API-Football e restituisce payload + quota. */
+/**
+ * Esegue una GET verso API-Football passando dal throttle centralizzato.
+ * NB: chiamate SEQUENZIALI, mai in parallelo.
+ */
 async function apiGet(
   path: string,
   params: Record<string, string>
@@ -149,6 +168,9 @@ async function apiGet(
     url.searchParams.set(k, v);
   }
 
+  // Throttle: garantisce l'intervallo minimo fra due richieste API-Football.
+  await sportsThrottle.waitTurn();
+
   let response: Response;
   try {
     response = await fetch(url.toString(), {
@@ -164,18 +186,18 @@ async function apiGet(
     );
   }
 
+  // Quota: aggiorna lo stato centralizzato e il valore di ritorno.
+  sportsThrottle.recordQuota(response.headers);
+  const centralQuota = sportsThrottle.getQuota();
   const quota: ApiQuotaMeta = {
-    requestsLimit: toNumberOrNull(
-      response.headers.get("x-ratelimit-requests-limit")
-    ),
-    requestsRemaining: toNumberOrNull(
-      response.headers.get("x-ratelimit-requests-remaining")
-    ),
+    requestsLimit: centralQuota.limit,
+    requestsRemaining: centralQuota.remaining,
   };
 
   if (response.status === 429) {
+    sportsThrottle.markRateLimited();
     throw new SportsApiError(
-      "Quota API esaurita (HTTP 429). Riprova domani o aumenta il piano.",
+      "Quota API esaurita (HTTP 429). Parte API interrotta.",
       "quota_exceeded",
       429,
       quota
@@ -207,11 +229,16 @@ async function apiGet(
   if (apiError) {
     apiError.httpStatus = response.status;
     apiError.quota = quota;
+    if (apiError.kind === "quota_exceeded") sportsThrottle.markRateLimited();
     throw apiError;
   }
 
   return { payload, quota };
 }
+
+// ------------------------------------------------------------
+// Fixtures (sync e aggiornamento risultati) — INVARIATI
+// ------------------------------------------------------------
 
 /**
  * Recupera le partite di una data (formato YYYY-MM-DD).
@@ -267,11 +294,8 @@ export interface MultiDateFixtures {
 }
 
 /**
- * Recupera le partite di più date, UNA richiesta per data.
- *
- * RESILIENTE: se una singola data fallisce (es. fuori dal range consentito
- * dal piano Free), NON interrompe il resto: prosegue con le date valide e
- * riporta per ogni data l'esito e il motivo. Non esegue retry.
+ * Recupera le partite di più date, UNA richiesta per data, in sequenza.
+ * RESILIENTE: se una singola data fallisce non interrompe il resto.
  */
 export async function fetchFixturesByDates(
   dates: string[]
@@ -297,8 +321,6 @@ export async function fetchFixturesByDates(
         errorKind: null,
       });
     } catch (err) {
-      // La chiamata è stata comunque effettuata (tranne missing_key, già
-      // gestito a monte). Non retry: registra e prosegui.
       requestsUsed += 1;
       const q =
         err instanceof SportsApiError
@@ -320,7 +342,6 @@ export async function fetchFixturesByDates(
     }
   }
 
-  // Dedup su fixture.id (una partita non deve comparire due volte).
   const byId = new Map<number, ApiFootballFixture>();
   const leagueMap = new Map<number, string>();
   let pagesTotal = 1;
@@ -345,7 +366,9 @@ export async function fetchFixturesByDates(
  * Recupera una lista di partite per id (fixture id), raggruppandole in
  * un'unica richiesta. Usato da "Aggiorna risultati".
  */
-export async function fetchFixturesByIds(ids: number[]): Promise<ApiFootballFixture[]> {
+export async function fetchFixturesByIds(
+  ids: number[]
+): Promise<ApiFootballFixture[]> {
   if (ids.length === 0) return [];
   const { payload } = await apiGet("/fixtures", {
     ids: ids.join("-"),
@@ -355,167 +378,145 @@ export async function fetchFixturesByIds(ids: number[]): Promise<ApiFootballFixt
 }
 
 // ------------------------------------------------------------
-// Deep data (per l'analisi). Ogni funzione è "best effort": il chiamante
-// le avvolge in try/catch e, in caso di errore, tratta il dato come
-// non disponibile invece di far fallire l'intera pipeline.
+// Quote reali — UNA richiesta per partita candidata
 // ------------------------------------------------------------
 
-export interface TeamStatistics {
-  form: string | null;
-  goalsFor: number | null;
-  goalsAgainst: number | null;
-  wins: number | null;
-  draws: number | null;
-  losses: number | null;
-  // ----------------------------------------------------------
-  // Campi aggiuntivi forniti dalle fonti alternative (es. OpenFootball).
-  // Sono OPZIONALI: la pipeline li mostra solo se presenti, senza inventare
-  // nulla. Le percentuali sono in forma decimale (0..1).
-  // ----------------------------------------------------------
-  played?: number | null;
-  points?: number | null;
-  rank?: number | null;
-  goalDifference?: number | null;
-  avgGoalsFor?: number | null;
-  avgGoalsAgainst?: number | null;
-  /** Forma nelle partite in casa / in trasferta (es. "WWDLW"). */
-  homeForm?: string | null;
-  awayForm?: string | null;
-  /** Percentuali sui risultati, su tutte le partite giocate. */
-  over15?: number | null;
-  over25?: number | null;
-  under45?: number | null;
-  btts?: number | null;
-  /** Ultime 5 partite giocate, già formattate per il prompt. */
-  last5?: string[] | null;
-}
-
-export interface HeadToHeadMatch {
-  date: string;
-  homeTeam: string;
-  awayTeam: string;
-  homeGoals: number | null;
-  awayGoals: number | null;
-}
-
-export interface StandingRow {
-  rank: number;
-  team: string;
-  points: number;
-  // Campi aggiuntivi opzionali forniti dalle fonti alternative (es. OpenFootball).
-  played?: number | null;
-  goalDifference?: number | null;
-}
-
-export interface InjuryInfo {
-  team: string;
-  player: string;
-  type: string;
-  reason: string;
+export interface OddsQuote {
+  market: MarketCode;
+  label: string;
+  /** Valore originale restituito dall'API (per diagnostica). */
+  apiValue: string;
+  odd: number;
 }
 
 export interface FixtureOdds {
+  /** Bookmaker scelto (Bet365 se disponibile, altrimenti deterministico). */
   bookmaker: string;
-  markets: { name: string; values: { value: string; odd: number }[] }[];
+  bookmakerId: number | null;
+  quotes: OddsQuote[];
+  byMarket: Partial<Record<MarketCode, OddsQuote>>;
 }
 
-export async function fetchTeamStatistics(
-  teamId: number,
-  leagueId: number,
-  season: number
-): Promise<TeamStatistics | null> {
-  const { payload } = await apiGet("/teams/statistics", {
-    team: String(teamId),
-    league: String(leagueId),
-    season: String(season),
-  });
-  const r = (payload.response as Record<string, unknown> | null) ?? null;
-  if (!r) return null;
+const PREFERRED_BOOKMAKER = "bet365";
 
-  return {
-    form: typeof r.form === "string" ? r.form : null,
-    goalsFor: toNumberOrNull((r.goals as any)?.for?.total?.total),
-    goalsAgainst: toNumberOrNull((r.goals as any)?.against?.total?.total),
-    wins: toNumberOrNull((r.fixtures as any)?.wins?.total),
-    draws: toNumberOrNull((r.fixtures as any)?.draws?.total),
-    losses: toNumberOrNull((r.fixtures as any)?.loses?.total),
-  };
+interface RawBookmaker {
+  id?: unknown;
+  name?: unknown;
+  bets?: { id?: unknown; name?: unknown; values?: unknown }[];
 }
 
-export async function fetchHeadToHead(
-  homeTeamId: number,
-  awayTeamId: number
-): Promise<HeadToHeadMatch[] | null> {
-  const { payload } = await apiGet("/fixtures/headtohead", {
-    h2h: `${homeTeamId}-${awayTeamId}`,
-  });
-  const arr = Array.isArray(payload.response) ? payload.response : [];
-  if (arr.length === 0) return null;
-  return arr.slice(0, 10).map((f: any) => ({
-    date: f?.fixture?.date ?? "",
-    homeTeam: f?.teams?.home?.name ?? "?",
-    awayTeam: f?.teams?.away?.name ?? "?",
-    homeGoals: toNumberOrNull(f?.goals?.home),
-    awayGoals: toNumberOrNull(f?.goals?.away),
-  }));
+/**
+ * Sceglie il bookmaker: Bet365 se presente, altrimenti il primo per id
+ * crescente (scelta DETERMINISTICA, non casuale).
+ */
+function pickBookmaker(bookmakers: RawBookmaker[]): RawBookmaker | null {
+  if (bookmakers.length === 0) return null;
+
+  const preferred = bookmakers.find((b) =>
+    String(b.name ?? "")
+      .toLowerCase()
+      .includes(PREFERRED_BOOKMAKER)
+  );
+  if (preferred) return preferred;
+
+  return [...bookmakers].sort((a, b) => {
+    const idA = toNumberOrNull(a.id) ?? Number.MAX_SAFE_INTEGER;
+    const idB = toNumberOrNull(b.id) ?? Number.MAX_SAFE_INTEGER;
+    if (idA !== idB) return idA - idB;
+    return String(a.name ?? "").localeCompare(String(b.name ?? ""));
+  })[0];
 }
 
-export async function fetchStandings(
-  leagueId: number,
-  season: number
-): Promise<StandingRow[] | null> {
-  const { payload } = await apiGet("/standings", {
-    league: String(leagueId),
-    season: String(season),
-  });
-  const first = (Array.isArray(payload.response) ? payload.response : [])[0] as any;
-  const groups = first?.league?.standings;
-  if (!Array.isArray(groups)) return null;
-
-  const rows: StandingRow[] = [];
-  for (const g of groups) {
-    if (!Array.isArray(g)) continue;
-    for (const r of g) {
-      rows.push({
-        rank: Number(r?.rank ?? 0),
-        team: r?.team?.name ?? "?",
-        points: Number(r?.points ?? 0),
-      });
-    }
-  }
-  return rows.length > 0 ? rows : null;
-}
-
-export async function fetchInjuries(teamId: number): Promise<InjuryInfo[] | null> {
-  const { payload } = await apiGet("/injuries", { team: String(teamId) });
-  const arr = Array.isArray(payload.response) ? payload.response : [];
-  if (arr.length === 0) return null;
-  return arr.slice(0, 20).map((i: any) => ({
-    team: i?.team?.name ?? "?",
-    player: i?.player?.name ?? "?",
-    type: i?.player?.type ?? "?",
-    reason: i?.player?.reason ?? "",
-  }));
-}
-
+/**
+ * Recupera le quote PRE-MATCH di una partita ed estrae SOLO i mercati
+ * ammessi e automaticamente liquidabili. UNA sola richiesta per partita.
+ *
+ * Restituisce null se nessun mercato ammesso è disponibile: in quel caso
+ * la partita resta "da valutare" (mai quote inventate).
+ */
 export async function fetchFixtureOdds(
   fixtureId: number
 ): Promise<FixtureOdds | null> {
-  // L'endpoint /odds è spesso riservato ai piani a pagamento: se non
-  // disponibile restituisce errore/403, gestito dal chiamante.
   const { payload } = await apiGet("/odds", { fixture: String(fixtureId) });
-  const arr = Array.isArray(payload.response) ? payload.response : [];
-  const bookmaker = (arr[0] as any)?.bookmakers?.[0];
+  const raw = Array.isArray(payload.response) ? payload.response : [];
+
+  const bookmakers: RawBookmaker[] = [];
+  for (const item of raw as { bookmakers?: RawBookmaker[] }[]) {
+    if (Array.isArray(item?.bookmakers)) bookmakers.push(...item.bookmakers);
+  }
+
+  const bookmaker = pickBookmaker(bookmakers);
   if (!bookmaker) return null;
 
+  const byMarket = extractQuotesFromBets(bookmaker.bets) as Partial<
+    Record<MarketCode, OddsQuote>
+  >;
+  const quotes = Object.values(byMarket) as OddsQuote[];
+  if (quotes.length === 0) return null;
+
   return {
-    bookmaker: bookmaker.name ?? "?",
-    markets: (bookmaker.bets ?? []).slice(0, 5).map((b: any) => ({
-      name: b?.name ?? "?",
-      values: (b?.values ?? []).slice(0, 3).map((v: any) => ({
-        value: v?.value ?? "?",
-        odd: Number(v?.odd ?? 0),
-      })),
-    })),
+    bookmaker: asTrimmedString(bookmaker.name) ?? "Bookmaker",
+    bookmakerId: toNumberOrNull(bookmaker.id),
+    quotes,
+    byMarket,
+  };
+}
+
+// ------------------------------------------------------------
+// Fallback leggero per competizioni non coperte da OpenFootball
+// ------------------------------------------------------------
+
+export interface FixturePrediction {
+  winner: string | null;
+  winOrDraw: boolean | null;
+  underOver: string | null;
+  advice: string | null;
+  percentHome: string | null;
+  percentDraw: string | null;
+  percentAway: string | null;
+  goalsHome: string | null;
+  goalsAway: string | null;
+}
+
+/**
+ * Recupera la previsione di API-Football per una partita.
+ * UNA sola richiesta, usata SOLO come contesto di fallback: il prompt la
+ * presenta esplicitamente come stima di terze parti, non come fatto certo.
+ */
+export async function fetchPrediction(
+  fixtureId: number
+): Promise<FixturePrediction | null> {
+  const { payload } = await apiGet("/predictions", {
+    fixture: String(fixtureId),
+  });
+  const first = (Array.isArray(payload.response) ? payload.response : [])[0] as
+    | {
+        predictions?: {
+          winner?: { name?: unknown };
+          win_or_draw?: unknown;
+          under_over?: unknown;
+          advice?: unknown;
+          percent?: { home?: unknown; draw?: unknown; away?: unknown };
+          goals?: { home?: unknown; away?: unknown };
+        };
+      }
+    | undefined;
+
+  const p = first?.predictions;
+  if (!p) return null;
+
+  const asText = (v: unknown) =>
+    typeof v === "string" || typeof v === "number" ? String(v) : null;
+
+  return {
+    winner: asText(p.winner?.name),
+    winOrDraw: typeof p.win_or_draw === "boolean" ? p.win_or_draw : null,
+    underOver: asTrimmedString(p.under_over),
+    advice: asTrimmedString(p.advice),
+    percentHome: asText(p.percent?.home),
+    percentDraw: asText(p.percent?.draw),
+    percentAway: asText(p.percent?.away),
+    goalsHome: asText(p.goals?.home),
+    goalsAway: asText(p.goals?.away),
   };
 }
