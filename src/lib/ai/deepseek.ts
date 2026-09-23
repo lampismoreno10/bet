@@ -59,16 +59,18 @@ Devi produrre UNA SOLA raccomandazione, scegliendo ESCLUSIVAMENTE tra i mercati 
 MERCATI SUPPORTATI (valori ammessi di "market" e "selection"):
 ${MARKET_LIST}
 
-Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo introduttivo, senza markdown:
+Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo introduttivo, senza markdown.
+
+ESEMPIO DI OUTPUT JSON VALIDO:
 {
-  "market": string,               // uno dei mercati supportati qui sopra
-  "selection": string,            // la selezione corrispondente
-  "estimatedProbability": number, // probabilità stimata 0..1 (es. 0.55)
-  "fairOdds": number,             // quota equa = 1 / estimatedProbability
-  "confidence": number,           // affidabilità 0..100
-  "state": string,                // "da_valutare" | "giocabile" | "scartata"
-  "reasons": string[],            // motivazioni brevi
-  "risks": string[]               // rischi e controindicazioni
+  "market": "Over/Under 2.5",
+  "selection": "Over 2.5",
+  "estimatedProbability": 0.57,
+  "fairOdds": 1.75,
+  "confidence": 68,
+  "state": "da_valutare",
+  "reasons": ["dato statistico coerente con la selezione"],
+  "risks": ["campione limitato"]
 }
 
 Regole:
@@ -327,7 +329,8 @@ export async function analyzeMatchWithDeepSeek(
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: "deepseek-v4-flash",
+        thinking: { type: "disabled" },
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
           { role: "user", content: userPrompt },
@@ -342,7 +345,22 @@ export async function analyzeMatchWithDeepSeek(
     return null;
   }
 
-  if (!response.ok) return null;
+  if (!response.ok) {
+    let detail = "";
+    try {
+      const errorBody = (await response.json()) as {
+        error?: { message?: unknown };
+        message?: unknown;
+      };
+      const raw = errorBody?.error?.message ?? errorBody?.message;
+      if (typeof raw === "string") detail = raw.slice(0, 300);
+    } catch {
+      // Il solo status HTTP e' gia' sufficiente per la diagnostica.
+    }
+    throw new Error(
+      `DeepSeek HTTP ${response.status}${detail ? `: ${detail}` : ""}`
+    );
+  }
 
   let data: unknown;
   try {
@@ -351,13 +369,33 @@ export async function analyzeMatchWithDeepSeek(
     return null;
   }
 
-  const content = (
-    data as { choices?: { message?: { content?: unknown } }[] } | null
-  )?.choices?.[0]?.message?.content;
-  if (typeof content !== "string") return null;
+  const choice = (
+    data as {
+      choices?: {
+        finish_reason?: unknown;
+        message?: { content?: unknown };
+      }[];
+    } | null
+  )?.choices?.[0];
+
+  const content = choice?.message?.content;
+  if (typeof content !== "string" || !content.trim()) {
+    throw new Error(
+      `DeepSeek ha restituito content vuoto (finish_reason=${String(
+        choice?.finish_reason ?? "unknown"
+      )})`
+    );
+  }
 
   const json = extractJson(content);
-  if (!json) return null;
+  if (!json) {
+    throw new Error("DeepSeek ha restituito contenuto non interpretabile come JSON.");
+  }
 
-  return parseAnalysis(json);
+  const parsed = parseAnalysis(json);
+  if (!parsed) {
+    throw new Error("DeepSeek ha restituito JSON senza market/selection validi.");
+  }
+
+  return parsed;
 }
