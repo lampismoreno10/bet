@@ -367,6 +367,27 @@ export interface TeamStatistics {
   wins: number | null;
   draws: number | null;
   losses: number | null;
+  // ----------------------------------------------------------
+  // Campi aggiuntivi forniti dalle fonti alternative (es. OpenFootball).
+  // Sono OPZIONALI: la pipeline li mostra solo se presenti, senza inventare
+  // nulla. Le percentuali sono in forma decimale (0..1).
+  // ----------------------------------------------------------
+  played?: number | null;
+  points?: number | null;
+  rank?: number | null;
+  goalDifference?: number | null;
+  avgGoalsFor?: number | null;
+  avgGoalsAgainst?: number | null;
+  /** Forma nelle partite in casa / in trasferta (es. "WWDLW"). */
+  homeForm?: string | null;
+  awayForm?: string | null;
+  /** Percentuali sui risultati, su tutte le partite giocate. */
+  over15?: number | null;
+  over25?: number | null;
+  under45?: number | null;
+  btts?: number | null;
+  /** Ultime 5 partite giocate, già formattate per il prompt. */
+  last5?: string[] | null;
 }
 
 export interface HeadToHeadMatch {
@@ -381,6 +402,9 @@ export interface StandingRow {
   rank: number;
   team: string;
   points: number;
+  // Campi aggiuntivi opzionali forniti dalle fonti alternative (es. OpenFootball).
+  played?: number | null;
+  goalDifference?: number | null;
 }
 
 export interface InjuryInfo {

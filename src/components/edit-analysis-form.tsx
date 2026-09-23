@@ -68,10 +68,16 @@ export function EditAnalysisForm({
   }, [match.kickoffAt]);
 
   const probability = toNumber(probabilityPct) / 100;
-  const bookOdds = toNumber(bet365Odds);
+  const parsedBookOdds = toNumber(bet365Odds);
+  // Quota bookmaker valida solo se > 1: altrimenti resta ASSENTE (mai 0).
+  const bookOdds = parsedBookOdds > 1 ? parsedBookOdds : null;
+  const oddsFieldInvalid = bet365Odds.trim() !== "" && bookOdds === null;
+
+  // La quota equa dipende solo dalla probabilità stimata; l'EV richiede una
+  // quota bookmaker reale, quindi senza di essa resta null (non calcolabile).
   const fairOdds = probability > 0 ? 1 / probability : 0;
-  const ev = probability > 0 && bookOdds > 0 ? probability * bookOdds - 1 : 0;
-  const hasPreview = probability > 0 && bookOdds > 0;
+  const ev =
+    probability > 0 && bookOdds != null ? probability * bookOdds - 1 : null;
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -240,12 +246,21 @@ export function EditAnalysisForm({
           <input
             type="number"
             step="0.01"
-            min="1"
+            min="1.01"
             className="input w-full"
             value={bet365Odds}
             onChange={(e) => setBet365Odds(e.target.value)}
-            required
           />
+          {oddsFieldInvalid ? (
+            <p className="mt-1 text-xs text-amber-300">
+              Quota non valida (deve essere &gt; 1): verrà salvata come assente e
+              l&apos;EV resterà non calcolabile.
+            </p>
+          ) : bet365Odds.trim() === "" ? (
+            <p className="mt-1 text-xs text-zinc-500">
+              Lascia vuoto se non hai una quota reale: nessun EV verrà calcolato.
+            </p>
+          ) : null}
         </Field>
 
         <Field label="Probabilità stimata (%)">
@@ -302,21 +317,21 @@ export function EditAnalysisForm({
         <div>
           <p className="label">Quota equa calcolata</p>
           <p className="mt-1 text-lg font-semibold tabular-nums text-zinc-100">
-            {hasPreview ? formatOdds(fairOdds) : "—"}
+            {probability > 0 ? formatOdds(fairOdds) : "—"}
           </p>
         </div>
         <div>
           <p className="label">EV calcolato</p>
           <p
             className={`mt-1 text-lg font-semibold tabular-nums ${
-              hasPreview
+              ev != null
                 ? ev >= 0
                   ? "text-emerald-400"
                   : "text-rose-400"
                 : "text-zinc-100"
             }`}
           >
-            {hasPreview ? formatEv(ev) : "—"}
+            {ev != null ? formatEv(ev) : "—"}
           </p>
         </div>
       </div>

@@ -32,9 +32,12 @@ export default async function MatchDetailPage({
   const canPlay =
     analysis.state === "da_valutare" || analysis.state === "giocabile";
 
-  const impliedProb = analysis.bet365Odds > 0 ? 1 / analysis.bet365Odds : 0;
+  const impliedProb =
+    analysis.bet365Odds != null && analysis.bet365Odds > 0
+      ? 1 / analysis.bet365Odds
+      : 0;
   const edge =
-    analysis.fairOdds > 0
+    analysis.bet365Odds != null && analysis.fairOdds > 0
       ? (analysis.bet365Odds / analysis.fairOdds - 1) * 100
       : 0;
 
@@ -79,7 +82,13 @@ export default async function MatchDetailPage({
         <Highlight
           label="EV"
           value={formatEv(analysis.ev)}
-          tone={analysis.ev >= 0 ? "text-emerald-400" : "text-rose-400"}
+          tone={
+            analysis.ev == null
+              ? "text-zinc-500"
+              : analysis.ev >= 0
+                ? "text-emerald-400"
+                : "text-rose-400"
+          }
         />
       </div>
 
@@ -146,7 +155,9 @@ export default async function MatchDetailPage({
             </Row>
             <Row label="Quota equa">{formatOdds(analysis.fairOdds)}</Row>
             <Row label="Differenza bookmaker − equa">
-              {formatOdds(analysis.bet365Odds - analysis.fairOdds)}
+              {analysis.bet365Odds != null
+                ? formatOdds(analysis.bet365Odds - analysis.fairOdds)
+                : "—"}
             </Row>
           </dl>
         </Section>
@@ -259,6 +270,9 @@ function decisionText(a: Analysis): string {
     case "giocabile":
       return "Valore positivo rilevato: partita giocabile.";
     default:
+      if (a.ev == null) {
+        return "EV non calcolabile: nessuna quota bookmaker reale disponibile.";
+      }
       return a.ev > 0
         ? "EV positivo ma sotto soglia: da valutare con attenzione."
         : "EV negativo: sconsigliata.";
@@ -267,7 +281,9 @@ function decisionText(a: Analysis): string {
 
 function motivationText(a: Analysis): string {
   const parts: string[] = [];
-  if (a.ev > 0) {
+  if (a.ev == null) {
+    parts.push("EV non calcolabile: manca una quota bookmaker reale.");
+  } else if (a.ev > 0) {
     parts.push(`EV positivo del ${(a.ev * 100).toFixed(1)}% rispetto alla quota equa.`);
   } else {
     parts.push("EV negativo: la quota giocabile è inferiore alla quota equa.");

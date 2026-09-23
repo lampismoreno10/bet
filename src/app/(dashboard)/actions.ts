@@ -10,13 +10,31 @@ import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import type { AnalysisInput, AnalysisState, MatchInput } from "@/types";
 
-/** Quota equa e EV derivati da probabilità stimata e quota bookmaker. */
-function derive(probability: number, bookmakerOdds: number) {
+/**
+ * Quota bookmaker valida (> 1) oppure null.
+ * Non si inventa mai una quota: campo vuoto, 0 o un valore <= 1 restano assenti.
+ */
+function asBookmakerOdds(value: number | null | undefined): number | null {
+  return value != null && Number.isFinite(value) && value > 1 ? value : null;
+}
+
+/**
+ * Quota bookmaker normalizzata, quota equa ed EV.
+ * La quota equa è calcolabile dalla probabilità stimata; l'EV NO: senza una
+ * quota bookmaker reale non esiste, quindi resta null (mai 0, mai -1).
+ */
+function derive(probability: number, bookmakerOdds: number | null | undefined) {
+  const odds = asBookmakerOdds(bookmakerOdds);
   const fairOdds = probability > 0 ? 1 / probability : 0;
-  const ev = probability * bookmakerOdds - 1;
+  const ev =
+    odds != null && probability > 0
+      ? Number((probability * odds - 1).toFixed(4))
+      : null;
+
   return {
+    odds,
     fairOdds: Number(fairOdds.toFixed(2)),
-    ev: Number(ev.toFixed(4)),
+    ev,
   };
 }
 
@@ -106,7 +124,7 @@ export async function createMatchWithAnalysis(
     return { error: matchError?.message ?? "Errore nel salvataggio della partita." };
   }
 
-  const { fairOdds, ev } = derive(
+  const { odds, fairOdds, ev } = derive(
     analysis.estimatedProbability,
     analysis.bet365Odds
   );
@@ -117,7 +135,7 @@ export async function createMatchWithAnalysis(
     market: analysis.market.trim(),
     selection: analysis.selection.trim(),
     analysis_odds: analysis.analysisOdds,
-    bet365_odds: analysis.bet365Odds,
+    bet365_odds: odds,
     estimated_probability: analysis.estimatedProbability,
     fair_odds: fairOdds,
     ev,
@@ -173,7 +191,7 @@ export async function updateAnalysis(
   } = await supabase.auth.getUser();
   if (!user) return { error: "Non autenticato" };
 
-  const { fairOdds, ev } = derive(
+  const { odds, fairOdds, ev } = derive(
     analysis.estimatedProbability,
     analysis.bet365Odds
   );
@@ -184,7 +202,7 @@ export async function updateAnalysis(
       market: analysis.market.trim(),
       selection: analysis.selection.trim(),
       analysis_odds: analysis.analysisOdds,
-      bet365_odds: analysis.bet365Odds,
+      bet365_odds: odds,
       estimated_probability: analysis.estimatedProbability,
       fair_odds: fairOdds,
       ev,

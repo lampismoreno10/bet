@@ -23,7 +23,16 @@ import {
 import {
   fetchFixturesByIds,
   isSportsApiConfigured,
+  type StandingRow,
+  type TeamStatistics,
 } from "@/lib/sports/api-football";
+import {
+  loadSerieA2026_27,
+  resolveOpenFootballTeam,
+  type OpenFootballLeague,
+  type OpenFootballMatchResult,
+  type OpenFootballTeamStats,
+} from "@/lib/sports/openfootball";
 import type {
   AnalysisOutcome,
   Match,
@@ -59,20 +68,35 @@ async function requireAdmin(): Promise<{ ok: true; userId: string } | { ok: fals
 //
 // ⚠️ Questa operazione NON effettua NESSUNA richiesta ad API-Football.
 // API-Football è riservata alla sola sincronizzazione delle partite
-// ("Aggiorna partite", sync-actions.ts).
+// ("Aggiorna partite", sync-actions.ts) e a "Aggiorna risultati".
 //
-// Qui l'analisi lavora esclusivamente sui dati di contesto disponibili
-// localmente. Finché non viene collegata una fonte alternativa il
-// contesto è vuoto: le partite restano "in attesa di analisi" e DeepSeek
-// NON viene interrogato. Non si inventano dati mancanti.
+// L'arricchimento viene da una fonte alternativa: OpenFootball /
+// football.json (CC0, nessuna API key, nessuno scraping HTML).
+// Il dataset della lega è un file statico: viene scaricato UNA sola volta
+// per esecuzione, mai una volta per partita. Per ora è supportata solo la
+// Serie A italiana 2026/27.
+//
+// Se una squadra non viene riconosciuta, o se la fonte non è disponibile,
+// la partita resta "in attesa di analisi" e DeepSeek NON viene interrogato.
+// Nessun dato viene inventato.
 // ------------------------------------------------------------
 
+/** Competizione supportata dalla fonte alternativa. */
+const OPENFOOTBALL_LEAGUE_ID = 135; // Serie A (id API-Football)
+const OPENFOOTBALL_SEASON = 2026; // stagione 2026/27
+
 /**
- * Costruisce il contesto di una partita SENZA alcuna chiamata esterna.
- * Una futura fonte alternativa (non API-Football) dovrà popolare qui i
- * blocchi di arricchimento; per ora restano tutti vuoti.
+ * La partita appartiene alla competizione supportata?
+ * Nessuna chiamata di rete: usa solo league_id/season salvati dalla sync.
+ * Gli import privi di league_id restano fuori (e quindi in attesa).
  */
-function buildMatchContext(match: Match): MatchContext {
+function isSupportedCompetition(match: Match): boolean {
+  if (match.leagueId !== OPENFOOTBALL_LEAGUE_ID) return false;
+  return match.season == null || match.season === OPENFOOTBALL_SEASON;
+}
+
+/** Contesto vuoto: nessun dato di arricchimento, nessuna invenzione. */
+function emptyContext(match: Match): MatchContext {
   return {
     homeTeam: match.homeTeam,
     awayTeam: match.awayTeam,
@@ -88,20 +112,98 @@ function buildMatchContext(match: Match): MatchContext {
   };
 }
 
+const RESULT_LABEL = { W: "V", D: "N", L: "P" } as const;
+
+/** Una riga leggibile per il prompt, es. "V 2-1 vs Como 1907 (casa)". */
+function formatLast5Entry(entry: OpenFootballMatchResult): string {
+  const venue = entry.home ? "casa" : "trasferta";
+  return `${RESULT_LABEL[entry.result]} ${entry.goalsFor}-${entry.goalsAgainst} vs ${entry.opponent} (${venue})`;
+}
+
+/** Adatta le statistiche OpenFootball al vocabolario condiviso del contesto. */
+function toTeamStatistics(stats: OpenFootballTeamStats): TeamStatistics {
+  return {
+    form: stats.seasonForm || null,
+    goalsFor: stats.goalsFor,
+    goalsAgainst: stats.goalsAgainst,
+    wins: stats.wins,
+    draws: stats.draws,
+    losses: stats.losses,
+    played: stats.played,
+    points: stats.points,
+    rank: stats.rank,
+    goalDifference: stats.goalDifference,
+    avgGoalsFor: stats.avgGoalsFor,
+    avgGoalsAgainst: stats.avgGoalsAgainst,
+    homeForm: stats.homeForm || null,
+    awayForm: stats.awayForm || null,
+    over15: stats.over15,
+    over25: stats.over25,
+    under45: stats.under45,
+    btts: stats.btts,
+    last5: stats.last5.map(formatLast5Entry),
+  };
+}
+
 /**
- * True solo se il contesto contiene almeno un dato di arricchimento reale.
- * Impedisce di chiamare DeepSeek quando i dati necessari mancano.
+ * Classifica calcolata dai risultati giocati.
+ *
+ * Le due squadre in campo vengono rinominate con il nome come è salvato in
+ * `matches` (es. "Inter" invece di "FC Internazionale Milano"): così la riga
+ * di classifica corrisponde a `homeTeam`/`awayTeam` del resto del contesto e
+ * il filtro sulla classifica nel prompt le riconosce.
+ */
+function toStandingRows(
+  league: OpenFootballLeague,
+  homeKey: string,
+  awayKey: string,
+  match: Match
+): StandingRow[] {
+  return league.standings.map((team) => ({
+    rank: team.rank,
+    team:
+      team.team === homeKey
+        ? match.homeTeam
+        : team.team === awayKey
+          ? match.awayTeam
+          : team.team,
+    points: team.points,
+    played: team.played,
+    goalDifference: team.goalDifference,
+  }));
+}
+
+/**
+ * Costruisce il contesto di una partita dai dati OpenFootball già in memoria.
+ * Entrambe le squadre devono essere riconosciute: se anche una sola non lo è,
+ * il contesto resta vuoto e la partita rimane in attesa.
+ */
+function buildMatchContext(match: Match, league: OpenFootballLeague): MatchContext {
+  const ctx = emptyContext(match);
+
+  const homeKey = resolveOpenFootballTeam(match.homeTeam, league);
+  const awayKey = resolveOpenFootballTeam(match.awayTeam, league);
+  if (!homeKey || !awayKey) return ctx;
+
+  const home = league.teams.get(homeKey);
+  const away = league.teams.get(awayKey);
+  if (!home || !away) return ctx;
+
+  return {
+    ...ctx,
+    homeStats: toTeamStatistics(home),
+    awayStats: toTeamStatistics(away),
+    standings: toStandingRows(league, homeKey, awayKey, match),
+  };
+}
+
+/**
+ * True solo se il contesto contiene i dati necessari per interrogare DeepSeek:
+ * servono ENTRAMBE le squadre. Con una sola squadra i dati sono insufficienti
+ * e la partita resta in attesa.
  */
 function hasEnoughContext(ctx: MatchContext): boolean {
-  return Boolean(
-    ctx.homeStats ||
-      ctx.awayStats ||
-      (ctx.h2h && ctx.h2h.length > 0) ||
-      (ctx.standings && ctx.standings.length > 0) ||
-      (ctx.homeInjuries && ctx.homeInjuries.length > 0) ||
-      (ctx.awayInjuries && ctx.awayInjuries.length > 0) ||
-      ctx.odds
-  );
+  return Boolean(ctx.homeStats && ctx.awayStats);
 }
 
 export async function analyzeMatches(): Promise<AnalysisOutcome> {
@@ -141,17 +243,53 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
     return error;
   }
 
-  // Nessuna chiamata API-Football: il contesto è costruito solo da dati locali.
+  // Fonte alternativa: UNA sola richiesta HTTP per esecuzione, e solo se c'è
+  // almeno una partita della competizione supportata.
+  const eligible = candidates.filter(isSupportedCompetition);
+  let league: OpenFootballLeague | null = null;
+  let sourceError: string | null = null;
+  if (eligible.length > 0) {
+    try {
+      league = await loadSerieA2026_27();
+    } catch (err) {
+      sourceError =
+        err instanceof Error ? err.message : "fonte OpenFootball non raggiungibile";
+    }
+  }
+
+  // Nessuna chiamata API-Football: il contesto viene costruito solo dai dati
+  // OpenFootball già in memoria.
   const prepared = candidates.map((match) => ({
     match,
-    ctx: buildMatchContext(match),
+    ctx:
+      league && isSupportedCompetition(match)
+        ? buildMatchContext(match, league)
+        : emptyContext(match),
   }));
   const ready = prepared.filter((p) => hasEnoughContext(p.ctx));
   const pending = prepared.length - ready.length;
 
+  // Diagnostica: squadre delle candidate supportate che non sono state
+  // riconosciute (le loro partite restano in attesa).
+  const unresolvedTeams = league
+    ? [
+        ...new Set(
+          eligible
+            .flatMap((m) => [m.homeTeam, m.awayTeam])
+            .filter((name) => !resolveOpenFootballTeam(name, league))
+        ),
+      ]
+    : [];
+
   // Nessuna candidata ha i dati necessari: non si chiama DeepSeek e non si
   // scrive nulla in `analyses`. Le partite restano in attesa di analisi.
   if (ready.length === 0) {
+    const reason = sourceError
+      ? `fonte OpenFootball non raggiungibile (${sourceError})`
+      : unresolvedTeams.length > 0
+        ? `squadre non riconosciute: ${unresolvedTeams.join(", ")}`
+        : "nessun dato di contesto disponibile per le competizioni supportate";
+
     try {
       await supabase.from("analysis_runs").insert({
         user_id: userId,
@@ -161,8 +299,8 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
         analyses_created: 0,
         requests_used: 0,
         deepseek_calls: 0,
-        status: "ok",
-        error_message: null,
+        status: sourceError ? "partial" : "ok",
+        error_message: sourceError,
       });
     } catch {
       // ignora: il log è accessorio
@@ -170,19 +308,19 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
 
     return {
       ok: true,
-      status: "ok",
-      message: `${pending} partite restano in attesa di analisi: nessun dato di contesto disponibile (nessuna fonte collegata).`,
+      status: sourceError ? "partial" : "ok",
+      message: `${pending} partite restano in attesa di analisi: ${reason}.`,
       candidatesFound: candidates.length,
       analyzed: 0,
       analysesCreated: 0,
       requestsUsed: 0,
       deepseekCalls: 0,
-      errors: [],
+      errors: sourceError ? [sourceError] : [],
     };
   }
 
-  // Da qui in poi il percorso DeepSeek è invariato: si attiva solo quando una
-  // fonte di arricchimento popolerà il contesto di almeno una partita.
+  // Da qui in poi il percorso DeepSeek è invariato: si attiva solo per le
+  // partite il cui contesto è stato popolato dalla fonte.
   if (!isDeepSeekConfigured()) {
     return { ok: false, status: "error", message: "DEEPSEEK_API_KEY non configurata sul server.", candidatesFound: candidates.length, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: ["DEEPSEEK_API_KEY non configurata"] };
   }
@@ -213,6 +351,13 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
     } catch (err) {
       errors.push(`${label}: ${err instanceof Error ? err.message : "errore imprevisto"}`);
     }
+  }
+
+  // Diagnostica: squadre non riconosciute fra le candidate supportate.
+  if (unresolvedTeams.length > 0) {
+    errors.push(
+      `squadre non riconosciute (partite lasciate in attesa): ${unresolvedTeams.join(", ")}`
+    );
   }
 
   // Log dell'operazione (accessorio, non deve bloccare).

@@ -26,8 +26,10 @@ export interface DeepSeekAnalysis {
   selection: string;
   estimatedProbability: number;
   fairOdds: number;
-  bookmakerOdds: number;
-  ev: number;
+  /** Quota bookmaker REALE. null se nessuna fonte la fornisce. */
+  bookmakerOdds: number | null;
+  /** EV = p × quota − 1. null quando bookmakerOdds manca: non calcolabile. */
+  ev: number | null;
   confidence: number;
   state: AnalysisState;
   reasons: string[];
@@ -62,8 +64,8 @@ Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo introduttivo, se
   "selection": string,       // es. "1", "X2", "Over 1.5", "Under 2.5", "1-3 gol"
   "estimatedProbability": number, // probabilità stimata 0..1 (es. 0.55)
   "fairOdds": number,        // quota equa = 1 / probabilità
-  "bookmakerOdds": number,   // quota disponibile se presente, altrimenti stima conservativa
-  "ev": number,              // expected value in forma decimale (es. 0.05)
+  "bookmakerOdds": number|null, // quota REALE se disponibile, altrimenti null (MAI stimata)
+  "ev": number|null,         // p × bookmakerOdds - 1; null se bookmakerOdds è null
   "confidence": number,      // affidabilità 0..100
   "state": string,           // "da_valutare" | "giocabile" | "scartata"
   "reasons": string[],       // motivazioni brevi
@@ -73,6 +75,7 @@ Rispondi ESCLUSIVAMENTE con un oggetto JSON valido, senza testo introduttivo, se
 Regole:
 - NON inventare dati mancanti: se un'informazione non è disponibile, non citarla oppure indica esplicitamente che manca.
 - Se i dati sono insufficienti, usa state "da_valutare" e confidence bassa (<=50).
+- Se nella sezione QUOTE non sono disponibili quote reali, imposta "bookmakerOdds": null e "ev": null. NON stimare, NON approssimare e NON fornire una quota "ipotetica" in alcun campo. "fairOdds" resta calcolabile da "estimatedProbability". In questo caso "state" deve essere "da_valutare" e "confidence" <= 50.
 - "giocabile" solo se c'è un valore chiaro (EV positivo) e dati sufficienti.
 - "scartata" se il valore è negativo o il rischio è troppo alto.
 - "estimatedProbability" deve essere un numero compreso tra 0 e 1.
@@ -127,6 +130,16 @@ function extractJson(content: string): Record<string, unknown> | null {
   return null;
 }
 
+/**
+ * Quota valida (> 1) oppure null.
+ * NON si fabbrica mai una quota: se non c'è una quota reale, resta assente.
+ */
+function asOdds(value: unknown): number | null {
+  if (value == null || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) && n > 1 ? n : null;
+}
+
 /** Valida e normalizza l'oggetto JSON restituito da DeepSeek. */
 function parseAnalysis(json: Record<string, unknown>): DeepSeekAnalysis | null {
   const market = typeof json.market === "string" ? json.market.trim() : "";
@@ -134,11 +147,24 @@ function parseAnalysis(json: Record<string, unknown>): DeepSeekAnalysis | null {
   if (!market && !selection) return null;
 
   const probability = clamp(Number(json.estimatedProbability), 0, 1);
-  const bookmakerOdds = Math.max(1.01, Number(json.bookmakerOdds) || 0);
-  const fairOdds = probability > 0 ? Number((1 / probability).toFixed(2)) : Number(json.fairOdds) || 0;
-  const ev = probability > 0 && bookmakerOdds > 0
-    ? Number((probability * bookmakerOdds - 1).toFixed(4))
-    : Number(json.ev) || 0;
+  const fairOdds = probability > 0
+    ? Number((1 / probability).toFixed(2))
+    : Number(json.fairOdds) || 0;
+
+  // Senza una quota REALE non esiste EV: entrambi restano null.
+  const bookmakerOdds = asOdds(json.bookmakerOdds);
+  const ev =
+    bookmakerOdds != null && probability > 0
+      ? Number((probability * bookmakerOdds - 1).toFixed(4))
+      : null;
+
+  // Regola tassativa applicata nel CODICE, non solo nel prompt: quando la
+  // quota reale manca, la partita resta "da valutare" con confidence <= 50.
+  const rawConfidence = Math.round(clamp(Number(json.confidence), 0, 100));
+  const state: AnalysisState =
+    bookmakerOdds != null ? normalizeState(json.state) : "da_valutare";
+  const confidence =
+    bookmakerOdds != null ? rawConfidence : Math.min(rawConfidence, 50);
 
   return {
     market,
@@ -147,8 +173,8 @@ function parseAnalysis(json: Record<string, unknown>): DeepSeekAnalysis | null {
     fairOdds,
     bookmakerOdds,
     ev,
-    confidence: Math.round(clamp(Number(json.confidence), 0, 100)),
-    state: normalizeState(json.state),
+    confidence,
+    state,
     reasons: asStringArray(json.reasons),
     risks: asStringArray(json.risks),
   };
@@ -159,9 +185,41 @@ function fmtStats(label: string, s: TeamStatistics | null): string {
   const parts: string[] = [];
   if (s.form) parts.push(`forma ${s.form}`);
   if (s.wins != null) parts.push(`${s.wins}V-${s.draws ?? 0}N-${s.losses ?? 0}P`);
+  if (s.played != null) parts.push(`${s.played} giocate`);
+  if (s.points != null) parts.push(`${s.points} pt`);
+  if (s.rank != null) parts.push(`posizione ${s.rank}`);
+  if (s.goalDifference != null) {
+    parts.push(`differenza reti ${s.goalDifference > 0 ? "+" : ""}${s.goalDifference}`);
+  }
   if (s.goalsFor != null) parts.push(`gol fatti ${s.goalsFor}`);
   if (s.goalsAgainst != null) parts.push(`gol subiti ${s.goalsAgainst}`);
+  if (s.avgGoalsFor != null) parts.push(`media gol fatti ${s.avgGoalsFor.toFixed(2)}`);
+  if (s.avgGoalsAgainst != null) {
+    parts.push(`media gol subiti ${s.avgGoalsAgainst.toFixed(2)}`);
+  }
+  if (s.homeForm) parts.push(`forma casa ${s.homeForm}`);
+  if (s.awayForm) parts.push(`forma trasferta ${s.awayForm}`);
   return `${label}: ${parts.length ? parts.join(", ") : "dati non disponibili"}`;
+}
+
+/**
+ * Percentuali sui risultati, su tutte le partite giocate.
+ * Restituisce null quando la fonte non le fornisce: niente righe inventate.
+ */
+function fmtPercentages(label: string, s: TeamStatistics | null): string | null {
+  if (!s) return null;
+  const parts: string[] = [];
+  if (s.over15 != null) parts.push(`Over 1.5 ${Math.round(s.over15 * 100)}%`);
+  if (s.over25 != null) parts.push(`Over 2.5 ${Math.round(s.over25 * 100)}%`);
+  if (s.under45 != null) parts.push(`Under 4.5 ${Math.round(s.under45 * 100)}%`);
+  if (s.btts != null) parts.push(`entrambe segnano ${Math.round(s.btts * 100)}%`);
+  return parts.length > 0 ? `${label}: ${parts.join(", ")}` : null;
+}
+
+/** Ultime 5 partite giocate, già formattate dalla fonte. */
+function fmtLast5(label: string, s: TeamStatistics | null): string | null {
+  if (!s?.last5 || s.last5.length === 0) return null;
+  return `${label}: ${s.last5.join("; ")}`;
 }
 
 export function buildContextText(ctx: MatchContext): string {
@@ -173,9 +231,26 @@ export function buildContextText(ctx: MatchContext): string {
     "FORMA SQUADRE",
     fmtStats(`- ${ctx.homeTeam}`, ctx.homeStats),
     fmtStats(`- ${ctx.awayTeam}`, ctx.awayStats),
-    "",
-    "PRECEDENTI (H2H)",
   ];
+
+  // Sezioni opzionali: compaiono solo se la fonte fornisce davvero i dati.
+  const percentages = [
+    fmtPercentages(`- ${ctx.homeTeam}`, ctx.homeStats),
+    fmtPercentages(`- ${ctx.awayTeam}`, ctx.awayStats),
+  ].filter((line): line is string => line !== null);
+  if (percentages.length > 0) {
+    lines.push("", "PERCENTUALI SUI RISULTATI (stagione)", ...percentages);
+  }
+
+  const last5 = [
+    fmtLast5(`- ${ctx.homeTeam}`, ctx.homeStats),
+    fmtLast5(`- ${ctx.awayTeam}`, ctx.awayStats),
+  ].filter((line): line is string => line !== null);
+  if (last5.length > 0) {
+    lines.push("", "ULTIME 5 PARTITE", ...last5);
+  }
+
+  lines.push("", "PRECEDENTI (H2H)");
 
   if (ctx.h2h && ctx.h2h.length > 0) {
     for (const h of ctx.h2h) {
@@ -192,7 +267,12 @@ export function buildContextText(ctx: MatchContext): string {
     );
     const shown = relevant.length > 0 ? relevant : ctx.standings.slice(0, 6);
     for (const r of shown) {
-      lines.push(`- #${r.rank} ${r.team} (${r.points} pt)`);
+      const played = r.played != null ? `, ${r.played} g` : "";
+      const diff =
+        r.goalDifference != null
+          ? `, differenza reti ${r.goalDifference > 0 ? "+" : ""}${r.goalDifference}`
+          : "";
+      lines.push(`- #${r.rank} ${r.team} (${r.points} pt${played}${diff})`);
     }
   } else {
     lines.push("- non disponibile");

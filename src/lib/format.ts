@@ -31,8 +31,9 @@ export function formatNumber(value: number): string {
   return numberFormatter.format(value);
 }
 
-/** Quota decimale: sempre 2 decimali. */
-export function formatOdds(value: number): string {
+/** Quota decimale: sempre 2 decimali. "—" quando la quota non esiste. */
+export function formatOdds(value: number | null | undefined): string {
+  if (value == null) return "—";
   return value.toFixed(2);
 }
 
@@ -42,8 +43,9 @@ export function formatPercent(value: number, signed = false): string {
   return `${sign}${value.toFixed(1)}%`;
 }
 
-/** EV in forma decimale -> percentuale con segno (es. 0.05 -> +5.00%). */
-export function formatEv(value: number): string {
+/** EV in forma decimale -> percentuale con segno. "—" quando non è calcolabile. */
+export function formatEv(value: number | null | undefined): string {
+  if (value == null) return "—";
   const sign = value >= 0 ? "+" : "";
   return `${sign}${(value * 100).toFixed(2)}%`;
 }

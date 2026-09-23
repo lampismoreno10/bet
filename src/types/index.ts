@@ -41,10 +41,10 @@ export interface Analysis {
   market: string; // mercato consigliato (es. "1X2", "Over/Under 2.5", "GG/NG")
   selection: string; // selezione consigliata (es. "1", "Over 2.5", "GG")
   analysisOdds: number; // quota di analisi
-  bet365Odds: number; // quota Bet365 effettivamente giocata
+  bet365Odds: number | null; // quota Bet365 reale; null se non disponibile
   estimatedProbability: number; // 0..1
   fairOdds: number; // quota equa = 1 / probabilità stimata
-  ev: number; // expected value in forma decimale (es. 0.05 = +5%)
+  ev: number | null; // EV in forma decimale (es. 0.05 = +5%); null senza quota reale
   confidence: number; // affidabilità 0..100
   risks: string; // rischi / motivazioni
   state: AnalysisState;
@@ -123,7 +123,8 @@ export interface AnalysisInput {
   market: string;
   selection: string;
   analysisOdds: number;
-  bet365Odds: number;
+  /** Quota bookmaker reale; null quando il campo è vuoto o non valida (> 1). */
+  bet365Odds: number | null;
   estimatedProbability: number; // 0..1
   confidence: number; // 0..100
   risks: string;

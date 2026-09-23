@@ -20,7 +20,12 @@ export function MatchCard({
   const { match, analysis } = item;
   const canPlay =
     analysis.state === "da_valutare" || analysis.state === "giocabile";
-  const evTone = analysis.ev >= 0 ? "text-emerald-400" : "text-rose-400";
+  const evTone =
+    analysis.ev == null
+      ? "text-zinc-500"
+      : analysis.ev >= 0
+        ? "text-emerald-400"
+        : "text-rose-400";
 
   return (
     <div className="card p-5 transition hover:border-white/[0.12]">
