@@ -83,6 +83,37 @@ mai mappata sul mercato dei gol.
 - `state = "giocabile"` richiede EV positivo sulla quota reale;
 - bookmaker preferito: **Bet365**, altrimenti scelta deterministica (id più basso).
 
+## Classificazione delle analisi (soglie server-side)
+
+La decisione finale **non** la prende il modello: `DeepSeek` propone solo
+`market`, `selection`, `estimatedProbability`, `confidence`, `reasons` e
+`risks`. Quota equa, EV e stato li calcola il server
+(`src/lib/sports/decision.ts`) **dopo** la risposta, verificando le quote
+reali.
+
+| Fonte dati | EV minimo | Affidabilità minima |
+| --- | --- | --- |
+| `openfootball` (dati completi) | **+5%** | **65** |
+| `api-football-prediction` (stima esterna) | **+8%** | **70** |
+
+- `giocabile` solo se **entrambe** le soglie della fonte sono soddisfatte;
+- dati presenti ma sotto soglia → **`scartata`**;
+- quota reale assente, mercato non validabile, contesto insufficiente o EV non
+  calcolabile → **`da_valutare`** (mai `giocabile`);
+- `fairOdds = 1 / estimatedProbability` e `EV = probabilità × quota − 1`,
+  sempre calcolati dal server;
+- **nessuna quota minima obbligatoria**: la selezione si valuta su EV,
+  affidabilità e qualità dei dati;
+- è **normale** che una giornata produca 0 giocabili: non si forza mai una
+  giocata. La motivazione della classificazione viene salvata con l'analisi.
+
+### Schedina (preparata, non ancora costruita)
+
+`buildSchedina()` seleziona al massimo **2** selezioni già `giocabile` con
+quota combinata preferibilmente **1,70–2,20**. Non inserisce mai una selezione
+scartata per raggiungere la quota e non forza nulla: senza selezioni valide
+restituisce `null`. La pipeline non la usa ancora.
+
 ## Limiti del piano Free API-Football
 
 100 richieste/giorno · 10 richieste/minuto · quote pre-match incluse.

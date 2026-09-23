@@ -40,6 +40,12 @@ import {
   resolveOpenFootballTeam,
   type OpenFootballDataset,
 } from "../src/lib/sports/openfootball.ts";
+import {
+  buildSchedina,
+  DECISION_THRESHOLDS,
+  decideAnalysis,
+  SCHEDINA_MAX_EVENTS,
+} from "../src/lib/sports/decision.ts";
 import { TRACKED_LEAGUES } from "../src/lib/sports/leagues.ts";
 
 // ------------------------------------------------------------
@@ -466,6 +472,185 @@ test("tutta la whitelist è gestibile: dataset oppure fallback", () => {
     (l) => l.kind === "club" && hasOpenFootballDataset(l.id, 2026)
   );
   assert.equal(clubCoperti.length, 6);
+});
+
+// ============================================================
+section("Motore decisionale — soglie OpenFootball");
+// ============================================================
+const OF = {
+  statsSource: "openfootball" as const,
+  hasRealOdds: true,
+  marketSupported: true,
+};
+
+test("OpenFootball EV 4.9% -> scartata", () => {
+  assert.equal(decideAnalysis({ ...OF, ev: 0.049, confidence: 90 }).state, "scartata");
+});
+test("OpenFootball EV 5% e confidence 65 -> giocabile", () => {
+  const d = decideAnalysis({ ...OF, ev: 0.05, confidence: 65 });
+  assert.equal(d.state, "giocabile");
+  assert.deepEqual(d.thresholds, { minEv: 0.05, minConfidence: 65 });
+});
+test("OpenFootball confidence 64 -> scartata", () => {
+  assert.equal(decideAnalysis({ ...OF, ev: 0.2, confidence: 64 }).state, "scartata");
+});
+test("OpenFootball EV 5% con confidence 100 -> giocabile (limite incluso)", () => {
+  assert.equal(decideAnalysis({ ...OF, ev: 0.05, confidence: 100 }).state, "giocabile");
+});
+test("OpenFootball EV negativo -> scartata", () => {
+  assert.equal(decideAnalysis({ ...OF, ev: -0.1, confidence: 99 }).state, "scartata");
+});
+
+// ============================================================
+section("Motore decisionale — soglie fallback API-Football");
+// ============================================================
+const FB = {
+  statsSource: "api-football-prediction" as const,
+  hasRealOdds: true,
+  marketSupported: true,
+};
+
+test("fallback EV 7.9% -> scartata", () => {
+  assert.equal(decideAnalysis({ ...FB, ev: 0.079, confidence: 95 }).state, "scartata");
+});
+test("fallback EV 8% e confidence 70 -> giocabile", () => {
+  const d = decideAnalysis({ ...FB, ev: 0.08, confidence: 70 });
+  assert.equal(d.state, "giocabile");
+  assert.deepEqual(d.thresholds, { minEv: 0.08, minConfidence: 70 });
+});
+test("fallback confidence 69 -> scartata", () => {
+  assert.equal(decideAnalysis({ ...FB, ev: 0.3, confidence: 69 }).state, "scartata");
+});
+test("le soglie del fallback sono più severe di OpenFootball", () => {
+  assert.ok(
+    DECISION_THRESHOLDS["api-football-prediction"].minEv >
+      DECISION_THRESHOLDS.openfootball.minEv
+  );
+  assert.ok(
+    DECISION_THRESHOLDS["api-football-prediction"].minConfidence >
+      DECISION_THRESHOLDS.openfootball.minConfidence
+  );
+});
+test("lo stesso EV 6% e' giocabile con OpenFootball ma scartata in fallback", () => {
+  assert.equal(decideAnalysis({ ...OF, ev: 0.06, confidence: 75 }).state, "giocabile");
+  assert.equal(decideAnalysis({ ...FB, ev: 0.06, confidence: 75 }).state, "scartata");
+});
+
+// ============================================================
+section("Motore decisionale — dati mancanti => da_valutare");
+// ============================================================
+test("quota reale mancante -> da_valutare, mai giocabile", () => {
+  const d = decideAnalysis({
+    ...OF,
+    hasRealOdds: false,
+    ev: null,
+    confidence: 99,
+  });
+  assert.equal(d.state, "da_valutare");
+  assert.equal(d.thresholds, null);
+});
+test("quota reale mancante ma EV presente -> comunque da_valutare", () => {
+  assert.equal(
+    decideAnalysis({ ...OF, hasRealOdds: false, ev: 0.3, confidence: 99 }).state,
+    "da_valutare"
+  );
+});
+test("mercato non valido -> da_valutare anche con EV alto", () => {
+  const d = decideAnalysis({ ...OF, marketSupported: false, ev: 0.3, confidence: 95 });
+  assert.equal(d.state, "da_valutare");
+});
+test("contesto statistico assente -> da_valutare", () => {
+  const d = decideAnalysis({
+    statsSource: null,
+    ev: 0.3,
+    confidence: 95,
+    hasRealOdds: true,
+    marketSupported: true,
+  });
+  assert.equal(d.state, "da_valutare");
+});
+test("EV non calcolabile -> da_valutare", () => {
+  assert.equal(decideAnalysis({ ...OF, ev: null, confidence: 99 }).state, "da_valutare");
+});
+test("le note spiegano la decisione (tracciabilita')", () => {
+  assert.ok(
+    decideAnalysis({ ...OF, ev: 0.05, confidence: 65 }).notes.join(" ").includes("giocabile")
+  );
+  assert.ok(
+    decideAnalysis({ ...OF, ev: 0.01, confidence: 90 }).notes.join(" ").includes("scartata")
+  );
+  assert.ok(
+    decideAnalysis({ ...OF, hasRealOdds: false, ev: null, confidence: 90 })
+      .notes.join(" ")
+      .includes("quota")
+  );
+});
+test("nessuna quota minima obbligatoria nelle soglie", () => {
+  for (const t of Object.values(DECISION_THRESHOLDS)) {
+    assert.equal(Object.prototype.hasOwnProperty.call(t, "minOdds"), false);
+  }
+});
+
+// ============================================================
+section("Schedina preparata (non ancora costruita dalla pipeline)");
+// ============================================================
+test("massimo 2 eventi con quota combinata preferita 1.70-2.20", () => {
+  const s = buildSchedina([
+    { id: "a", odds: 1.4, ev: 0.08, confidence: 70 },
+    { id: "b", odds: 1.35, ev: 0.07, confidence: 70 },
+    { id: "c", odds: 3.0, ev: 0.09, confidence: 70 },
+  ]);
+  assert.ok(s);
+  assert.ok(s.picks.length <= SCHEDINA_MAX_EVENTS);
+  assert.equal(s.inTargetRange, true);
+  assert.ok(s.totalOdds >= 1.7 && s.totalOdds <= 2.2);
+});
+test("senza selezioni valide restituisce null (non si forza nulla)", () => {
+  assert.equal(buildSchedina([]), null);
+});
+test("quota fuori intervallo viene segnalata, non forzata", () => {
+  const s = buildSchedina([{ id: "a", odds: 5, ev: 0.1, confidence: 80 }]);
+  assert.ok(s);
+  assert.equal(s.inTargetRange, false);
+});
+test("EV combinato = (1+ev1)(1+ev2)-1", () => {
+  const s = buildSchedina([
+    { id: "a", odds: 1.4, ev: 0.05, confidence: 70 },
+    { id: "b", odds: 1.4, ev: 0.1, confidence: 70 },
+  ]);
+  assert.ok(s);
+  assert.equal(s.picks.length, 2);
+  assert.equal(s.combinedEv, Number((1.05 * 1.1 - 1).toFixed(4)));
+});
+test("quote non valide vengono ignorate", () => {
+  assert.equal(buildSchedina([{ id: "a", odds: 0, ev: 0.1, confidence: 80 }]), null);
+});
+
+// ============================================================
+section("Prompt DeepSeek allineato alle regole decisionali");
+// ============================================================
+test("il modello non deve produrre state / EV / quota equa", () => {
+  const src = readFileSync("src/lib/ai/deepseek.ts", "utf8");
+  assert.ok(src.includes("COSA NON DEVI PRODURRE"));
+  assert.equal(src.includes('"state": string'), false);
+  assert.equal(src.includes('"fairOdds": number'), false);
+  assert.equal(src.includes("normalizeState"), false);
+  // il codice non legge più lo stato dalla risposta del modello
+  assert.equal(/json\.state/.test(src), false);
+});
+test("il prompt impone prudenza e segnala la stima esterna", () => {
+  const src = readFileSync("src/lib/ai/deepseek.ts", "utf8");
+  assert.ok(src.includes("Sii PRUDENTE"));
+  assert.ok(src.includes("non alzare \"estimatedProbability\" solo perché API-Football"));
+  assert.ok(src.includes("ABBASSA \"confidence\""));
+  assert.ok(src.includes("NON una statistica indipendente verificata"));
+  assert.ok(src.includes("QUOTE REALI DISPONIBILI"));
+  assert.ok(src.includes("è normale e frequente che una partita non sia giocabile"));
+});
+test("lo stato viene deciso solo dal motore server-side", () => {
+  const src = readFileSync("src/app/(dashboard)/analysis-actions.ts", "utf8");
+  assert.ok(src.includes("decideAnalysis("));
+  assert.ok(src.includes("decision.state"));
 });
 
 // ============================================================

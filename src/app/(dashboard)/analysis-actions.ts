@@ -28,6 +28,7 @@ import {
   settleMarket,
   type MarketCode,
 } from "@/lib/sports/markets";
+import { decideAnalysis } from "@/lib/sports/decision";
 import { createClient } from "@/lib/supabase/server";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import {
@@ -58,6 +59,7 @@ import {
 import { sportsThrottle } from "@/lib/sports/throttle";
 import type {
   AnalysisOutcome,
+  AnalysisState,
   Match,
   MatchState,
   ResultsOutcome,
@@ -201,24 +203,32 @@ function hasEnoughContext(ctx: MatchContext): boolean {
 // ------------------------------------------------------------
 
 interface ResolvedAnalysis extends DeepSeekAnalysis {
+  /** Quota equa calcolata dal server: 1 / estimatedProbability. */
+  fairOdds: number;
+  /** Stato deciso dal SERVER (mai dal modello). */
+  state: AnalysisState;
   bookmakerOdds: number | null;
   ev: number | null;
   bookmaker: string | null;
-  /** True se la quota reale è stata trovata e usata. */
-  hasRealOdds: boolean;
+  /** Note della decisione server-side, persistite con l'analisi. */
+  decisionNotes: string[];
 }
 
 /**
- * Verifica la scelta del modello contro le quote REALI:
- *  - il mercato/selezione deve essere tra quelli supportati;
- *  - deve esistere la quota reale corrispondente.
+ * Verifica la scelta del modello contro le quote REALI e decide lo stato.
  *
- * La quota NON viene mai presa dalla risposta del modello. Senza quota reale:
- * bookmakerOdds = null, ev = null, state "da_valutare" e confidence <= 50.
+ *  - il mercato/scelta deve essere supportato e presente nelle quote reali;
+ *  - quota equa ed EV li calcola il SERVER (mai il modello);
+ *  - lo stato finale (giocabile / scartata / da_valutare) lo decide
+ *    `decideAnalysis` in base alla FONTE DATI e alle sue soglie:
+ *      OpenFootball           -> EV >= 5%  e affidabilità >= 65
+ *      fallback API-Football  -> EV >= 8%  e affidabilità >= 70
+ *    Dati mancanti o mercato non validabile -> "da_valutare".
  */
 function resolveAnalysisAgainstOdds(
   analysis: DeepSeekAnalysis,
-  odds: FixtureOdds | null
+  odds: FixtureOdds | null,
+  statsSource: StatsSource
 ): ResolvedAnalysis {
   const code: MarketCode | null = parseModelSelection(
     analysis.market,
@@ -231,15 +241,19 @@ function resolveAnalysisAgainstOdds(
       ? computeEv(analysis.estimatedProbability, bookmakerOdds)
       : null;
 
-  let state = analysis.state;
-  let confidence = analysis.confidence;
-  if (bookmakerOdds == null) {
-    state = "da_valutare";
-    confidence = Math.min(confidence, 50);
-  } else if (state === "giocabile" && (ev == null || ev <= 0)) {
-    // "giocabile" richiede un valore dimostrabile sulla quota reale.
-    state = "da_valutare";
-  }
+  const decision = decideAnalysis({
+    statsSource,
+    ev,
+    confidence: analysis.confidence,
+    hasRealOdds: bookmakerOdds != null,
+    marketSupported: code != null,
+  });
+
+  // Senza quota reale l'affidabilità non può restare alta.
+  const confidence =
+    bookmakerOdds != null
+      ? analysis.confidence
+      : Math.min(analysis.confidence, 50);
 
   const spec = code ? getMarket(code) : undefined;
 
@@ -248,12 +262,12 @@ function resolveAnalysisAgainstOdds(
     market: spec?.modelMarket ?? analysis.market,
     selection: spec?.modelSelection ?? analysis.selection,
     fairOdds: computeFairOdds(analysis.estimatedProbability),
-    state,
+    state: decision.state,
     confidence,
     bookmakerOdds,
     ev,
     bookmaker: quote ? (odds?.bookmaker ?? null) : null,
-    hasRealOdds: bookmakerOdds != null,
+    decisionNotes: decision.notes,
   };
 }
 
@@ -265,6 +279,9 @@ async function insertAnalysis(
   a: ResolvedAnalysis,
   statsSource: StatsSource
 ): Promise<string | null> {
+  // Motivazioni del modello + note della decisione server-side.
+  const reasons = [...a.reasons, ...a.decisionNotes];
+
   const payload: Record<string, unknown> = {
     user_id: userId,
     match_id: matchId,
@@ -279,7 +296,9 @@ async function insertAnalysis(
     risks: a.risks.length ? a.risks.join(" | ") : a.reasons.join(" | ") || null,
     state: a.state,
     source: statsSource ?? "deepseek",
-    reasons: a.reasons.length ? a.reasons : null,
+    // Le note del motore decisionale vengono registrate con l'analisi, così
+    // la motivazione della classificazione resta tracciabile.
+    reasons: reasons.length ? reasons : null,
   };
 
   let { error } = await supabase
@@ -413,8 +432,8 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
       }
       analyzed += 1;
 
-      // 2d) Validazione contro le quote reali + salvataggio.
-      const resolved = resolveAnalysisAgainstOdds(analysis, odds);
+      // 2d) Validazione contro le quote reali + decisione server-side.
+      const resolved = resolveAnalysisAgainstOdds(analysis, odds, ctx.statsSource);
       const insertError = await insertAnalysis(
         supabase,
         userId,

@@ -13,17 +13,14 @@
 import { allowedMarketList } from "@/lib/sports/markets";
 import type { FixtureOdds, FixturePrediction } from "@/lib/sports/api-football";
 import type { StandingRow, TeamStatistics } from "@/lib/sports/openfootball";
-import type { AnalysisState } from "@/types";
 
 export interface DeepSeekAnalysis {
   market: string;
   selection: string;
-  estimatedProbability: number;
-  fairOdds: number;
-  confidence: number;
-  state: AnalysisState;
-  reasons: string[];
-  risks: string[];
+  estimatedProbability: number; // 0..1 — stima prudente del modello
+  confidence: number; // 0..100
+  reasons: string[]; // quali dati concreti supportano la probabilità
+  risks: string[]; // elementi che la rendono poco affidabile
 }
 
 /** Fonte del contesto statistico usata per questa partita. */
@@ -66,23 +63,25 @@ ESEMPIO DI OUTPUT JSON VALIDO:
   "market": "Over/Under 2.5",
   "selection": "Over 2.5",
   "estimatedProbability": 0.57,
-  "fairOdds": 1.75,
   "confidence": 68,
-  "state": "da_valutare",
   "reasons": ["dato statistico coerente con la selezione"],
   "risks": ["campione limitato"]
 }
 
+COSA NON DEVI PRODURRE:
+- NON inserire alcun campo "state", "bookmakerOdds", "ev" o "fairOdds". La decisione finale (giocabile / scartata / da_valutare), la quota equa e l'EV sono calcolati dal SISTEMA a partire dalle quote REALI. La tua opinione sullo stato non viene usata.
+
 Regole:
 - NON inventare dati mancanti: se un'informazione non è disponibile, non citarla oppure indica esplicitamente che manca.
-- NON inventare, stimare o approssimare QUOTE. Non inserire alcun campo "bookmakerOdds" o "ev": le quote reali e l'EV li calcola il sistema.
+- Sii PRUDENTE: non alzare "estimatedProbability" solo perché API-Football indica una squadra favorita. Una probabilità gonfiata rispetto alla quota reale produce un EV falso e fa scartare l'analisi.
+- In "reasons" indica QUALI DATI CONCRETI sostengono la probabilità (forma, gol fatti/subiti, casa/trasferta, Over/BTTS, classifica, quote).
+- In "risks" indica cosa può renderla POCO AFFIDABILE (dati parziali o assenti, campione ridotto, stima esterna, mercato instabile, assenze non note).
+- Se la tua stima è molto più alta di quanto implica la quota del bookmaker, ABBASSA "confidence" e spiegalo nei "risks".
 - Scegli il mercato SOLO tra quelli supportati e SOLO se nella sezione QUOTE compare la quota reale corrispondente.
-- Se per il mercato scelto non esiste una quota reale, imposta state "da_valutare" e confidence <= 50.
-- Le percentuali e il contesto marcati come "stima di terze parti" NON sono fatti certi: trattali come indizi, non come dati verificati.
-- Se i dati sono insufficienti, usa state "da_valutare" e confidence bassa (<=50).
-- "giocabile" solo se c'è un valore chiaro (EV positivo rispetto alla quota reale) e dati sufficienti.
-- "scartata" se il valore è negativo o il rischio è troppo alto.
+- Se per nessun mercato supportato esiste una quota reale, indica comunque il mercato con la probabilità più difendibile, con "confidence" <= 50.
+- Il contesto marcato come "stima di terze parti" NON è un fatto certo: API-Football prediction è una stima esterna, NON una statistica indipendente verificata. Trattala come indizio debole e non farci salire la probabilità.
 - "estimatedProbability" deve essere un numero compreso tra 0 e 1.
+- NON sei obbligato a trovare valore: è normale e frequente che una partita non sia giocabile. Il sistema applica soglie minime di EV e affidabilità e scarterà ciò che non le raggiunge.
 - Rispondi SOLO con il JSON.`;
 
 function clamp(value: number, min: number, max: number): number {
@@ -93,11 +92,6 @@ function clamp(value: number, min: number, max: number): number {
 function asStringArray(v: unknown): string[] {
   if (!Array.isArray(v)) return [];
   return v.filter((x): x is string => typeof x === "string").slice(0, 6);
-}
-
-function normalizeState(v: unknown): AnalysisState {
-  if (v === "giocabile" || v === "scartata" || v === "da_valutare") return v;
-  return "da_valutare";
 }
 
 /** Estrae il JSON dalla risposta, tollerando eventuali ```json ```. */
@@ -147,18 +141,12 @@ function parseAnalysis(json: Record<string, unknown>): DeepSeekAnalysis | null {
   if (!market && !selection) return null;
 
   const probability = clamp(Number(json.estimatedProbability), 0, 1);
-  const fairOdds =
-    probability > 0
-      ? Number((1 / probability).toFixed(2))
-      : Number(json.fairOdds) || 0;
 
   return {
     market,
     selection,
     estimatedProbability: probability,
-    fairOdds,
     confidence: Math.round(clamp(Number(json.confidence), 0, 100)),
-    state: normalizeState(json.state),
     reasons: asStringArray(json.reasons),
     risks: asStringArray(json.risks),
   };
@@ -208,7 +196,7 @@ function fmtLast5(label: string, s: TeamStatistics | null): string | null {
  */
 function fmtOdds(odds: FixtureOdds | null): string[] {
   if (!odds || odds.quotes.length === 0) {
-    return ["- nessuna quota reale disponibile: scegli comunque un mercato supportato ma imposta state \"da_valutare\"."];
+    return ["- nessuna quota reale disponibile: indica comunque il mercato con la probabilità più difendibile, con \"confidence\" <= 50. Lo stato lo decide il sistema."];
   }
   const lines = [`- Bookmaker: ${odds.bookmaker}`];
   for (const q of odds.quotes) {
