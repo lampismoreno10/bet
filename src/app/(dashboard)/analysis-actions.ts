@@ -2,7 +2,7 @@
 
 // ============================================================
 // Operazioni operative (solo server, solo admin):
-//   - analyzeMatches   -> pipeline analisi (pre-filtro -> dati -> DeepSeek -> salva)
+//   - analyzeMatches   -> analisi dai soli dati locali (NESSUNA chiamata API-Football)
 //   - runFullPipeline  -> sync + analisi in sequenza
 //   - updateResults    -> aggiorna stato e risultato delle partite
 // ============================================================
@@ -21,18 +21,8 @@ import {
   type MatchContext,
 } from "@/lib/ai/deepseek";
 import {
-  fetchFixtureOdds,
   fetchFixturesByIds,
-  fetchHeadToHead,
-  fetchInjuries,
-  fetchStandings,
-  fetchTeamStatistics,
   isSportsApiConfigured,
-  type FixtureOdds,
-  type HeadToHeadMatch,
-  type InjuryInfo,
-  type StandingRow,
-  type TeamStatistics,
 } from "@/lib/sports/api-football";
 import type {
   AnalysisOutcome,
@@ -66,18 +56,58 @@ async function requireAdmin(): Promise<{ ok: true; userId: string } | { ok: fals
 
 // ------------------------------------------------------------
 // ANALIZZA PARTITE
+//
+// ⚠️ Questa operazione NON effettua NESSUNA richiesta ad API-Football.
+// API-Football è riservata alla sola sincronizzazione delle partite
+// ("Aggiorna partite", sync-actions.ts).
+//
+// Qui l'analisi lavora esclusivamente sui dati di contesto disponibili
+// localmente. Finché non viene collegata una fonte alternativa il
+// contesto è vuoto: le partite restano "in attesa di analisi" e DeepSeek
+// NON viene interrogato. Non si inventano dati mancanti.
 // ------------------------------------------------------------
+
+/**
+ * Costruisce il contesto di una partita SENZA alcuna chiamata esterna.
+ * Una futura fonte alternativa (non API-Football) dovrà popolare qui i
+ * blocchi di arricchimento; per ora restano tutti vuoti.
+ */
+function buildMatchContext(match: Match): MatchContext {
+  return {
+    homeTeam: match.homeTeam,
+    awayTeam: match.awayTeam,
+    competition: match.competition,
+    kickoffAt: match.kickoffAt,
+    homeStats: null,
+    awayStats: null,
+    h2h: null,
+    standings: null,
+    homeInjuries: null,
+    awayInjuries: null,
+    odds: null,
+  };
+}
+
+/**
+ * True solo se il contesto contiene almeno un dato di arricchimento reale.
+ * Impedisce di chiamare DeepSeek quando i dati necessari mancano.
+ */
+function hasEnoughContext(ctx: MatchContext): boolean {
+  return Boolean(
+    ctx.homeStats ||
+      ctx.awayStats ||
+      (ctx.h2h && ctx.h2h.length > 0) ||
+      (ctx.standings && ctx.standings.length > 0) ||
+      (ctx.homeInjuries && ctx.homeInjuries.length > 0) ||
+      (ctx.awayInjuries && ctx.awayInjuries.length > 0) ||
+      ctx.odds
+  );
+}
 
 export async function analyzeMatches(): Promise<AnalysisOutcome> {
   const auth = await requireAdmin();
   if (!auth.ok) {
     return { ok: false, status: "error", message: auth.message, candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: [auth.message] };
-  }
-  if (!isSportsApiConfigured()) {
-    return { ok: false, status: "error", message: "SPORTS_API_KEY non configurata.", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: ["SPORTS_API_KEY non configurata"] };
-  }
-  if (!isDeepSeekConfigured()) {
-    return { ok: false, status: "error", message: "DEEPSEEK_API_KEY non configurata sul server.", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: ["DEEPSEEK_API_KEY non configurata"] };
   }
 
   const candidates = await getAnalysisCandidates();
@@ -87,49 +117,6 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
 
   const supabase = await createClient();
   const userId = auth.userId;
-
-  let requestsUsed = 0;
-  let deepseekCalls = 0;
-  let analyzed = 0;
-  let analysesCreated = 0;
-  const errors: string[] = [];
-
-  // Cache interne per non ripetere le stesse chiamate (stessa squadra/lega).
-  const teamStatsCache = new Map<string, TeamStatistics | null>();
-  const standingsCache = new Map<string, StandingRow[] | null>();
-  const injuriesCache = new Map<number, InjuryInfo[] | null>();
-
-  async function safe<T>(fn: () => Promise<T | null>): Promise<T | null> {
-    requestsUsed += 1;
-    try {
-      return await fn();
-    } catch {
-      return null;
-    }
-  }
-
-  async function teamStats(teamId: number, leagueId: number, season: number) {
-    const key = `${teamId}:${leagueId}:${season}`;
-    if (!teamStatsCache.has(key)) {
-      teamStatsCache.set(key, await safe(() => fetchTeamStatistics(teamId, leagueId, season)));
-    }
-    return teamStatsCache.get(key) ?? null;
-  }
-
-  async function standings(leagueId: number, season: number) {
-    const key = `${leagueId}:${season}`;
-    if (!standingsCache.has(key)) {
-      standingsCache.set(key, await safe(() => fetchStandings(leagueId, season)));
-    }
-    return standingsCache.get(key) ?? null;
-  }
-
-  async function injuries(teamId: number) {
-    if (!injuriesCache.has(teamId)) {
-      injuriesCache.set(teamId, await safe(() => fetchInjuries(teamId)));
-    }
-    return injuriesCache.get(teamId) ?? null;
-  }
 
   async function insertAnalysis(matchId: string, a: DeepSeekAnalysis) {
     const { error } = await supabase.from("analyses").upsert(
@@ -154,62 +141,60 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
     return error;
   }
 
-  for (const match of candidates) {
+  // Nessuna chiamata API-Football: il contesto è costruito solo da dati locali.
+  const prepared = candidates.map((match) => ({
+    match,
+    ctx: buildMatchContext(match),
+  }));
+  const ready = prepared.filter((p) => hasEnoughContext(p.ctx));
+  const pending = prepared.length - ready.length;
+
+  // Nessuna candidata ha i dati necessari: non si chiama DeepSeek e non si
+  // scrive nulla in `analyses`. Le partite restano in attesa di analisi.
+  if (ready.length === 0) {
+    try {
+      await supabase.from("analysis_runs").insert({
+        user_id: userId,
+        sync_date: todayIsoDate(),
+        candidates_found: candidates.length,
+        analyzed: 0,
+        analyses_created: 0,
+        requests_used: 0,
+        deepseek_calls: 0,
+        status: "ok",
+        error_message: null,
+      });
+    } catch {
+      // ignora: il log è accessorio
+    }
+
+    return {
+      ok: true,
+      status: "ok",
+      message: `${pending} partite restano in attesa di analisi: nessun dato di contesto disponibile (nessuna fonte collegata).`,
+      candidatesFound: candidates.length,
+      analyzed: 0,
+      analysesCreated: 0,
+      requestsUsed: 0,
+      deepseekCalls: 0,
+      errors: [],
+    };
+  }
+
+  // Da qui in poi il percorso DeepSeek è invariato: si attiva solo quando una
+  // fonte di arricchimento popolerà il contesto di almeno una partita.
+  if (!isDeepSeekConfigured()) {
+    return { ok: false, status: "error", message: "DEEPSEEK_API_KEY non configurata sul server.", candidatesFound: candidates.length, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: ["DEEPSEEK_API_KEY non configurata"] };
+  }
+
+  let analyzed = 0;
+  let analysesCreated = 0;
+  let deepseekCalls = 0;
+  const errors: string[] = [];
+
+  for (const { match, ctx } of ready) {
     const label = `${match.homeTeam} vs ${match.awayTeam}`;
     try {
-      const extId = Number(match.externalId);
-      if (!Number.isFinite(extId)) {
-        errors.push(`${label}: external_id non valido`);
-        continue;
-      }
-
-      // Risolvi id squadre / lega / season se mancanti (import vecchi).
-      let leagueId = match.leagueId;
-      let season = match.season;
-      let homeId = match.homeTeamId;
-      let awayId = match.awayTeamId;
-
-      if (leagueId == null || season == null || homeId == null || awayId == null) {
-        const fixtures = await safe(() => fetchFixturesByIds([extId]));
-        const fx = fixtures?.[0];
-        if (fx) {
-          leagueId = fx.league?.id ?? leagueId;
-          season = fx.league?.season ?? season;
-          homeId = fx.teams?.home?.id ?? homeId;
-          awayId = fx.teams?.away?.id ?? awayId;
-        }
-      }
-
-      const homeStats = homeId != null && leagueId != null && season != null
-        ? await teamStats(homeId, leagueId, season)
-        : null;
-      const awayStats = awayId != null && leagueId != null && season != null
-        ? await teamStats(awayId, leagueId, season)
-        : null;
-      const h2h: HeadToHeadMatch[] | null = homeId != null && awayId != null
-        ? await safe(() => fetchHeadToHead(homeId as number, awayId as number))
-        : null;
-      const table = leagueId != null && season != null
-        ? await standings(leagueId, season)
-        : null;
-      const homeInjuries = homeId != null ? await injuries(homeId) : null;
-      const awayInjuries = awayId != null ? await injuries(awayId) : null;
-      const odds: FixtureOdds | null = await safe(() => fetchFixtureOdds(extId));
-
-      const ctx: MatchContext = {
-        homeTeam: match.homeTeam,
-        awayTeam: match.awayTeam,
-        competition: match.competition,
-        kickoffAt: match.kickoffAt,
-        homeStats,
-        awayStats,
-        h2h,
-        standings: table,
-        homeInjuries,
-        awayInjuries,
-        odds,
-      };
-
       const analysis = await analyzeMatchWithDeepSeek(ctx);
       deepseekCalls += 1;
 
@@ -238,7 +223,7 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
       candidates_found: candidates.length,
       analyzed,
       analyses_created: analysesCreated,
-      requests_used: requestsUsed,
+      requests_used: 0,
       deepseek_calls: deepseekCalls,
       status: errors.length > 0 && analysesCreated > 0 ? "partial" : errors.length > 0 ? "error" : "ok",
       error_message: errors.length > 0 ? errors.join(" | ").slice(0, 1000) : null,
@@ -255,12 +240,12 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
     status,
     message:
       analysesCreated > 0
-        ? `${analysesCreated} analisi create su ${candidates.length} candidate.`
-        : `Nessuna analisi creata (${candidates.length} candidate, ${errors.length} problemi).`,
+        ? `${analysesCreated} analisi create su ${ready.length} candidate con dati.`
+        : `Nessuna analisi creata (${ready.length} candidate con dati, ${errors.length} problemi).`,
     candidatesFound: candidates.length,
     analyzed,
     analysesCreated,
-    requestsUsed,
+    requestsUsed: 0,
     deepseekCalls,
     errors: errors.slice(0, 10),
   };
