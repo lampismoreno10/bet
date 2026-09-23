@@ -329,7 +329,7 @@ export async function analyzeMatchWithDeepSeek(
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "deepseek-v4-flash",
+        model: "deepseek-flash",
         thinking: { type: "disabled" },
         messages: [
           { role: "system", content: SYSTEM_PROMPT },
