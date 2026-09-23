@@ -39,7 +39,7 @@ import {
 } from "@/lib/ai/deepseek";
 import {
   fetchFixtureOdds,
-  fetchFixturesByIds,
+  fetchFixturesByDate,
   fetchPrediction,
   isSportsApiConfigured,
   type FixtureOdds,
@@ -634,7 +634,7 @@ export async function updateResults(): Promise<ResultsOutcome> {
 
   const { data: matches } = await supabase
     .from("matches")
-    .select("id, external_id, status")
+    .select("id, external_id, status, kickoff_at")
     .eq("user_id", userId)
     .not("external_id", "is", null)
     .neq("status", "finished");
@@ -645,27 +645,54 @@ export async function updateResults(): Promise<ResultsOutcome> {
   let updated = 0;
   let finished = 0;
 
-  const ids = rows
-    .map((r) => Number(r.external_id))
-    .filter((n) => Number.isFinite(n));
+  // Piano Free API-Football: il parametro `ids` non è disponibile.
+  // Recuperiamo quindi i risultati per DATA (endpoint consentito sul Free)
+  // e riconciliamo localmente tramite external_id.
+  const romeDateFormatter = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Europe/Rome",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  });
+  const toRomeIsoDate = (value: unknown): string | null => {
+    if (typeof value !== "string") return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+    const parts = romeDateFormatter.formatToParts(date);
+    const year = parts.find((p) => p.type === "year")?.value;
+    const month = parts.find((p) => p.type === "month")?.value;
+    const day = parts.find((p) => p.type === "day")?.value;
+    return year && month && day ? `${year}-${month}-${day}` : null;
+  };
 
-  const CHUNK = 20;
-  for (let i = 0; i < ids.length; i += CHUNK) {
+  const today = todayIsoDate();
+  const rowsByDate = new Map<string, typeof rows>();
+  for (const row of rows) {
+    const date = toRomeIsoDate(row.kickoff_at);
+    // Le partite future non hanno risultati da aggiornare. Le rinviate
+    // verranno riprese dal normale sync quando compariranno sulla nuova data.
+    if (!date || date > today) continue;
+    const bucket = rowsByDate.get(date) ?? [];
+    bucket.push(row);
+    rowsByDate.set(date, bucket);
+  }
+
+  const resultDates = [...rowsByDate.keys()].sort();
+
+  for (const date of resultDates) {
     if (!sportsThrottle.canSpend(1)) {
       errors.push("quota API-Football insufficiente: aggiornamento risultati interrotto.");
       break;
     }
 
-    const chunk = ids.slice(i, i + CHUNK);
-    const chunkSet = new Set(chunk.map(String));
-    const chunkRows = rows.filter((r) => chunkSet.has(String(r.external_id)));
-
     try {
       requestsUsed += 1;
-      const fixtures = await fetchFixturesByIds(chunk);
-      const byExternal = new Map(fixtures.map((f) => [String(f.fixture.id), f]));
+      const result = await fetchFixturesByDate(date);
+      const byExternal = new Map(
+        result.fixtures.map((f) => [String(f.fixture.id), f])
+      );
 
-      for (const row of chunkRows) {
+      for (const row of rowsByDate.get(date) ?? []) {
         const fx = byExternal.get(String(row.external_id));
         if (!fx) continue;
 
@@ -689,7 +716,7 @@ export async function updateResults(): Promise<ResultsOutcome> {
       }
     } catch (err) {
       errors.push(
-        err instanceof Error ? err.message : "errore durante il recupero risultati"
+        `${date}: ${err instanceof Error ? err.message : "errore durante il recupero risultati"}`
       );
     }
   }
