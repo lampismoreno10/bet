@@ -7,7 +7,11 @@
 import { createClient } from "@/lib/supabase/server";
 import { isDemoMode } from "@/lib/config";
 import { todayIsoDate } from "@/lib/dates";
-import { selectCandidates } from "@/lib/analysis";
+import {
+  isSupportedForAnalysis,
+  selectCandidates,
+  supportedLeagueIds,
+} from "@/lib/analysis";
 import {
   demoAnalyses,
   demoBankrollTransactions,
@@ -333,8 +337,13 @@ export async function getLastSyncRun(): Promise<SyncRun | null> {
 }
 
 /**
- * Partite candidate all'analisi: importate, senza analisi, in programma
- * o in corso, ordinate per calcio d'inizio e limitate dal pre-filtro.
+ * Partite candidate all'analisi: importate, senza analisi, in programma o in
+ * corso, appartenenti a una competizione SUPPORTATA, ordinate per calcio
+ * d'inizio e limitate dal pre-filtro.
+ *
+ * Il tetto `max` (MAX_ANALYSIS_PER_RUN) è applicato DOPO il filtro per
+ * competizione: le partite delle competizioni non ancora supportate restano
+ * in attesa e non occupano i posti disponibili.
  * (Nessuna chiamata API: è il pre-filtro locale.)
  */
 export async function getAnalysisCandidates(max?: number): Promise<Match[]> {
@@ -349,6 +358,9 @@ export async function getAnalysisCandidates(max?: number): Promise<Match[]> {
       // Solo partite non ancora terminate: evita di caricare lo storico
       // (che altrimenti riempirebbe la finestra del limit).
       .in("status", ["scheduled", "live"])
+      // Filtro in query: evita che partite non supportate consumino la
+      // finestra del limit prima del filtro applicativo.
+      .in("league_id", supportedLeagueIds())
       .order("kickoff_at", { ascending: true })
       .limit(300),
     supabase.from("analyses").select("match_id"),
@@ -359,7 +371,8 @@ export async function getAnalysisCandidates(max?: number): Promise<Match[]> {
     .filter((m) => !analyzed.has(m.id))
     .map(mapMatch);
 
-  return selectCandidates(unanalyzed, max);
+  // Filtro autorevole (copre anche la stagione), poi ordina e taglia a `max`.
+  return selectCandidates(unanalyzed.filter(isSupportedForAnalysis), max);
 }
 
 /** Ultima operazione di analisi registrata (null se mai eseguita). */

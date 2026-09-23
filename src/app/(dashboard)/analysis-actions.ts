@@ -81,19 +81,11 @@ async function requireAdmin(): Promise<{ ok: true; userId: string } | { ok: fals
 // Nessun dato viene inventato.
 // ------------------------------------------------------------
 
-/** Competizione supportata dalla fonte alternativa. */
-const OPENFOOTBALL_LEAGUE_ID = 135; // Serie A (id API-Football)
-const OPENFOOTBALL_SEASON = 2026; // stagione 2026/27
-
-/**
- * La partita appartiene alla competizione supportata?
- * Nessuna chiamata di rete: usa solo league_id/season salvati dalla sync.
- * Gli import privi di league_id restano fuori (e quindi in attesa).
- */
-function isSupportedCompetition(match: Match): boolean {
-  if (match.leagueId !== OPENFOOTBALL_LEAGUE_ID) return false;
-  return match.season == null || match.season === OPENFOOTBALL_SEASON;
-}
+// La definizione di "competizione supportata" vive in `lib/analysis.ts`
+// (SUPPORTED_ANALYSIS_LEAGUES). È lì che il pre-filtro delle candidate la
+// applica, così il tetto MAX_ANALYSIS_PER_RUN non viene occupato dalle
+// partite di competizioni non ancora supportate: quelle restano in attesa
+// senza essere toccate.
 
 /** Contesto vuoto: nessun dato di arricchimento, nessuna invenzione. */
 function emptyContext(match: Match): MatchContext {
@@ -212,9 +204,10 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
     return { ok: false, status: "error", message: auth.message, candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: [auth.message] };
   }
 
+  // Solo partite di competizioni supportate: le altre restano in attesa.
   const candidates = await getAnalysisCandidates();
   if (candidates.length === 0) {
-    return { ok: true, status: "ok", message: "Nessuna partita da analizzare (nessuna candidata senza analisi).", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: [] };
+    return { ok: true, status: "ok", message: "Nessuna partita da analizzare: nessuna candidata delle competizioni supportate (Serie A 2026/27).", candidatesFound: 0, analyzed: 0, analysesCreated: 0, requestsUsed: 0, deepseekCalls: 0, errors: [] };
   }
 
   const supabase = await createClient();
@@ -243,12 +236,11 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
     return error;
   }
 
-  // Fonte alternativa: UNA sola richiesta HTTP per esecuzione, e solo se c'è
-  // almeno una partita della competizione supportata.
-  const eligible = candidates.filter(isSupportedCompetition);
+  // Fonte alternativa: UNA sola richiesta HTTP per esecuzione. Le candidate
+  // sono già filtrate per competizione supportata da `getAnalysisCandidates`.
   let league: OpenFootballLeague | null = null;
   let sourceError: string | null = null;
-  if (eligible.length > 0) {
+  if (candidates.length > 0) {
     try {
       league = await loadSerieA2026_27();
     } catch (err) {
@@ -258,23 +250,21 @@ export async function analyzeMatches(): Promise<AnalysisOutcome> {
   }
 
   // Nessuna chiamata API-Football: il contesto viene costruito solo dai dati
-  // OpenFootball già in memoria.
+  // OpenFootball già in memoria. Se una squadra non è riconosciuta,
+  // `buildMatchContext` restituisce un contesto vuoto (partita in attesa).
   const prepared = candidates.map((match) => ({
     match,
-    ctx:
-      league && isSupportedCompetition(match)
-        ? buildMatchContext(match, league)
-        : emptyContext(match),
+    ctx: league ? buildMatchContext(match, league) : emptyContext(match),
   }));
   const ready = prepared.filter((p) => hasEnoughContext(p.ctx));
   const pending = prepared.length - ready.length;
 
-  // Diagnostica: squadre delle candidate supportate che non sono state
-  // riconosciute (le loro partite restano in attesa).
+  // Diagnostica: squadre delle candidate che non sono state riconosciute
+  // (le loro partite restano in attesa).
   const unresolvedTeams = league
     ? [
         ...new Set(
-          eligible
+          candidates
             .flatMap((m) => [m.homeTeam, m.awayTeam])
             .filter((name) => !resolveOpenFootballTeam(name, league))
         ),
